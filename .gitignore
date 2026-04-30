@@ -1,0 +1,23 @@
+# Project notes (local only)
+CLAUDE.md
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets / temp
+.pypirc
+/tmp/.pypirc
