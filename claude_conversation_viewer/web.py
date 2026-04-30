@@ -332,6 +332,10 @@ def parse_full_conversation(filepath: Path) -> list:
                                 "tool_use_id": block.get("tool_use_id", ""),
                                 "content": str(rc)[:5000],
                             })
+                        elif btype == "thinking":
+                            thinking_text = block.get("thinking", "")
+                            if thinking_text:
+                                blocks.append({"type": "thinking", "text": thinking_text})
                     if blocks:
                         entry["content"] = blocks
                     else:
@@ -772,9 +776,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
   --yellow-dim:    rgba(234, 179, 8, 0.1);
   --red:           #ef4444;
   --cyan:          #22d3ee;
-  --user-bg:       rgba(99, 102, 241, 0.07);
-  --user-border:   rgba(99, 102, 241, 0.18);
-  --asst-border:   rgba(139, 92, 246, 0.12);
+  --user-bg:          rgba(56, 139, 253, 0.07);
+  --user-border:      rgba(56, 139, 253, 0.22);
+  --user-accent:      #3b82f6;
+  --asst-bg:          rgba(139, 92, 246, 0.07);
+  --asst-border:      rgba(139, 92, 246, 0.22);
+  --asst-accent:      #8b5cf6;
+  --thinking-bg:      rgba(245, 158, 11, 0.06);
+  --thinking-border:  rgba(245, 158, 11, 0.25);
+  --thinking-accent:  #f59e0b;
+  --thinking-dim:     rgba(245, 158, 11, 0.12);
   --radius:        10px;
   --radius-sm:     6px;
   --radius-xs:     4px;
@@ -1207,11 +1218,13 @@ body {
 .message.user {
   background: var(--user-bg);
   border-color: var(--user-border);
+  border-left: 3px solid var(--user-accent);
 }
 
 .message.assistant {
-  background: var(--bg-surface);
+  background: var(--asst-bg);
   border-color: var(--asst-border);
+  border-left: 3px solid var(--asst-accent);
 }
 
 .message-header {
@@ -1232,8 +1245,59 @@ body {
   padding: 2px 7px;
   border-radius: 4px;
 }
-.message.user .message-role { color: var(--indigo); background: var(--indigo-dim); }
+.message.user .message-role { color: #60a5fa; background: rgba(56,139,253,0.15); }
 .message.assistant .message-role { color: var(--accent-bright); background: var(--accent-dim); }
+
+/* ── Thinking block ── */
+.thinking-block {
+  background: var(--thinking-bg);
+  border: 1px solid var(--thinking-border);
+  border-left: 3px solid var(--thinking-accent);
+  border-radius: var(--radius-sm);
+  margin: 8px 0;
+}
+.thinking-header {
+  display: flex; align-items: center; gap: 7px;
+  padding: 7px 12px; cursor: pointer; user-select: none;
+}
+.thinking-label {
+  font-size: 10.5px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.06em; color: var(--thinking-accent);
+  background: var(--thinking-dim); padding: 2px 7px; border-radius: 4px;
+}
+.thinking-arrow { color: var(--thinking-accent); font-size: 10px; transition: transform 0.15s; }
+.thinking-arrow.open { transform: rotate(90deg); }
+.thinking-body {
+  padding: 0 12px 12px;
+  font-size: 13px; line-height: 1.6; color: var(--text-muted);
+  font-style: italic; white-space: pre-wrap; word-break: break-word;
+}
+
+/* ── Search highlight ── */
+mark.search-highlight {
+  background: rgba(251, 191, 36, 0.35);
+  color: #fde68a;
+  border-radius: 2px;
+  padding: 0 2px;
+  outline: 1px solid rgba(251, 191, 36, 0.5);
+}
+
+/* ── Color legend ── */
+.conv-legend {
+  display: flex; align-items: center; gap: 16px;
+  padding: 7px 20px;
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border);
+  font-size: 11px; color: var(--text-muted);
+  flex-shrink: 0;
+}
+.legend-item { display: flex; align-items: center; gap: 5px; }
+.legend-dot {
+  width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0;
+}
+.legend-dot.user     { background: var(--user-accent); }
+.legend-dot.asst     { background: var(--asst-accent); }
+.legend-dot.thinking { background: var(--thinking-accent); }
 
 .message-model { font-size: 11px; color: var(--text-muted); }
 
@@ -1659,6 +1723,13 @@ pre:hover .copy-btn { opacity: 1; }
       </div>
     </div>
 
+    <div class="conv-legend" id="convLegend" style="display:none">
+      <span style="color:var(--text-faint);font-weight:600;margin-right:4px;">KEY</span>
+      <span class="legend-item"><span class="legend-dot user"></span> You</span>
+      <span class="legend-item"><span class="legend-dot asst"></span> Claude</span>
+      <span class="legend-item"><span class="legend-dot thinking"></span> Thinking</span>
+    </div>
+
     <div class="messages-container" id="messagesContainer">
       <div class="empty-state">
         <div class="empty-icon">&#9670;</div>
@@ -1891,7 +1962,7 @@ function renderSearchResults(results, query) {
     return;
   }
   container.innerHTML = results.map((r, i) => `
-    <div class="conv-item ${r.id === currentConvId ? 'active' : ''}" data-id="${escapeHtml(r.id)}" data-idx="${i}" onclick="loadConversation('${escapeHtml(r.id)}')">
+    <div class="conv-item ${r.id === currentConvId ? 'active' : ''}" data-id="${escapeHtml(r.id)}" data-idx="${i}" onclick="loadConversation('${escapeHtml(r.id)}', ${JSON.stringify(query)})">
       <div class="conv-item-top">
         <span class="conv-project">${escapeHtml(shortenPath(r.project_path) || r.project_path)}</span>
         <button class="bookmark-btn ${r.bookmarked ? 'bookmarked' : ''}" onclick="event.stopPropagation();toggleBookmark('${escapeHtml(r.id)}',this)" title="Bookmark">&#9733;</button>
@@ -2094,9 +2165,10 @@ function showExportMenu(el) {
 }
 
 // ── Load conversation ──
-async function loadConversation(id) {
+async function loadConversation(id, searchQuery = null) {
   currentConvId = id;
   document.getElementById('app').classList.add('conv-open');
+  document.getElementById('convLegend').style.display = 'flex';
   selectedIdx = -1;
 
   document.querySelectorAll('.conv-item').forEach(el => {
@@ -2131,7 +2203,41 @@ async function loadConversation(id) {
   }
 
   addCopyButtons(container);
-  container.scrollTop = 0;
+
+  if (searchQuery) {
+    highlightAndScroll(container, searchQuery);
+  } else {
+    container.scrollTop = 0;
+  }
+}
+
+function highlightAndScroll(container, query) {
+  if (!query || query.length < 2) { container.scrollTop = 0; return; }
+  const lq = query.toLowerCase();
+
+  function walk(node) {
+    if (node.nodeType === 3) {
+      const text = node.textContent;
+      const idx = text.toLowerCase().indexOf(lq);
+      if (idx === -1) return;
+      const before = document.createTextNode(text.slice(0, idx));
+      const mark = document.createElement('mark');
+      mark.className = 'search-highlight';
+      mark.textContent = text.slice(idx, idx + query.length);
+      const after = document.createTextNode(text.slice(idx + query.length));
+      const p = node.parentNode;
+      p.replaceChild(after, node);
+      p.insertBefore(mark, after);
+      p.insertBefore(before, mark);
+    } else if (node.nodeType === 1 && !['SCRIPT','STYLE','PRE','CODE'].includes(node.tagName)) {
+      Array.from(node.childNodes).forEach(walk);
+    }
+  }
+  walk(container);
+
+  const first = container.querySelector('mark.search-highlight');
+  if (first) first.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  else container.scrollTop = 0;
 }
 
 // ── Render message ──
@@ -2165,6 +2271,7 @@ function renderMessage(msg) {
 
   const bodyHtml = content.map(block => {
     if (block.type === 'text') return renderMarkdown(block.text);
+    if (block.type === 'thinking') return renderThinking(block);
     if (block.type === 'tool_use') return renderToolUse(block);
     if (block.type === 'tool_result') return renderToolResult(block);
     return '';
@@ -2184,6 +2291,19 @@ function renderMessage(msg) {
         </div>
       </div>
       <div class="message-body">${bodyHtml}</div>
+    </div>`;
+}
+
+function renderThinking(block) {
+  const id = 'think-' + Math.random().toString(36).substr(2, 8);
+  return `
+    <div class="thinking-block">
+      <div class="thinking-header" onclick="toggleBlock('${id}')">
+        <span class="thinking-arrow" id="${id}-arrow">&#9654;</span>
+        <span class="thinking-label">Thinking</span>
+        <span style="font-size:11px;color:var(--text-faint);margin-left:4px;">Claude's internal reasoning</span>
+      </div>
+      <div class="thinking-body" id="${id}" style="display:none">${escapeHtml(block.text)}</div>
     </div>`;
 }
 
