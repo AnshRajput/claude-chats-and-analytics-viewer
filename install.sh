@@ -8,20 +8,22 @@ echo "  Claude Chats & Analytics Viewer"
 echo "  ================================"
 echo ""
 
-# ── 1. Try pipx (already installed) ──────────────────────────────────────────
+# ── 1. Try uv (already installed) — fastest, no permanent install ────────────
+if command -v uv >/dev/null 2>&1; then
+  echo "  [1/2] Installing via uv..."
+  uv tool install "$PKG" --quiet 2>/dev/null || uv tool upgrade "$PKG" --quiet
+  echo "  [2/2] Done!"
+  echo ""
+  exec uv tool run --from "$PKG" ccv
+fi
+
+# ── 2. Try pipx (already installed) ──────────────────────────────────────────
 if command -v pipx >/dev/null 2>&1; then
   echo "  [1/2] Installing via pipx..."
   pipx install "$PKG" 2>/dev/null || pipx upgrade "$PKG"
   echo "  [2/2] Done!"
   echo ""
-  exec pipx run "$PKG"
-fi
-
-# ── 2. Try uv (already installed) ────────────────────────────────────────────
-if command -v uv >/dev/null 2>&1; then
-  echo "  [1/1] Launching via uv (no install needed)..."
-  echo ""
-  exec uv tool run "$PKG"
+  exec "$HOME/.local/bin/ccv"
 fi
 
 # ── 3. macOS: install pipx via Homebrew ──────────────────────────────────────
