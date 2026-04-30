@@ -2672,12 +2672,12 @@ def main():
     try:
         server = HTTPServer(("127.0.0.1", port), Handler)
     except OSError:
-        # Port busy — find the next free one automatically
         import socket
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
             port = s.getsockname()[1]
         print(f"\n  Port {args.port} is already in use — switching to port {port}")
+        print(f"  Tip: use 'ccv --port {port}' next time to use this port directly.")
         server = HTTPServer(("127.0.0.1", port), Handler)
     url = f"http://127.0.0.1:{port}"
 
