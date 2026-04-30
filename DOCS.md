@@ -78,8 +78,11 @@ The viewer auto-detects the correct path on each platform.
 ### Install from PyPI
 
 ```bash
-pip3 install claude-chats-and-analytics-viewer && ccv
+pipx install claude-chats-and-analytics-viewer && ccv
 ```
+
+> **macOS / Homebrew users:** Use `pipx` — Homebrew Python blocks system-wide pip installs (PEP 668).
+> Install pipx with: `brew install pipx && pipx ensurepath`
 
 This installs the following commands:
 
@@ -90,9 +93,10 @@ This installs the following commands:
 | `claude-dashboard` | Start Web UI |
 | `claude-conversations-cli` | Start the terminal CLI |
 
-> **Note:** If pip3 installs scripts to a directory not on your PATH (e.g., `~/.local/bin` on Linux or `~/Library/Python/3.x/bin` on macOS), add it:
+> **Alternatives:**
 > ```bash
-> export PATH="$HOME/.local/bin:$PATH"
+> pip3 install --user claude-chats-and-analytics-viewer   # pip with --user flag
+> uvx claude-chats-and-analytics-viewer                   # uv (no install needed)
 > ```
 
 ### Install from Source
@@ -100,7 +104,7 @@ This installs the following commands:
 ```bash
 git clone https://github.com/AnshRajput/claude-chats-and-analytics-viewer.git
 cd claude-chats-and-analytics-viewer
-pip3 install .
+pipx install .
 ```
 
 ### Verify Installation
@@ -283,7 +287,7 @@ To update manually:
 ```bash
 ccv --update
 # or
-pip3 install --upgrade claude-chats-and-analytics-viewer
+pipx upgrade claude-chats-and-analytics-viewer
 ```
 
 ---
@@ -359,15 +363,16 @@ ccv --port 8080
 lsof -i :5005 && kill <PID>
 ```
 
-### Commands not found after pip3 install
+### Commands not found after install
 
+If using `pipx`, run `pipx ensurepath` then restart your terminal.
+
+If using `pip3 --user`:
 ```bash
-python3 -m site --user-base
 export PATH="$(python3 -m site --user-base)/bin:$PATH"
 ```
 
-Or run via module:
-
+Or run directly via Python:
 ```bash
 python3 -m claude_conversation_viewer.web
 python3 -m claude_conversation_viewer.cli

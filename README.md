@@ -12,22 +12,24 @@ Browse, search, and resume your [Claude Code](https://docs.anthropic.com/en/docs
 ## One-command install & run
 
 ```bash
-pip3 install claude-chats-and-analytics-viewer && ccv
+pipx install claude-chats-and-analytics-viewer && ccv
 ```
 
 That's it. Opens `http://127.0.0.1:5005` in your browser.
 
+> Don't have pipx? `brew install pipx && pipx ensurepath` (macOS) or `pip3 install --user pipx` (Linux/Windows)
+
 ### Alternatives
 
 ```bash
-# With pipx (no permanent install)
-pipx run claude-chats-and-analytics-viewer
-
 # With uv (fastest, no install needed)
 uvx claude-chats-and-analytics-viewer
 
 # Shell script (auto install + launch)
 curl -fsSL https://raw.githubusercontent.com/AnshRajput/claude-chats-and-analytics-viewer/main/install.sh | sh
+
+# pip with --user flag (if you don't want pipx)
+pip3 install --user claude-chats-and-analytics-viewer
 ```
 
 ---
