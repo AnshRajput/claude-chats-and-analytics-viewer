@@ -1,17 +1,18 @@
-# Claude Code Conversation Viewer
+# Claude Chats & Analytics Viewer
 
 Browse, search, and resume your [Claude Code](https://docs.anthropic.com/en/docs/claude-code) conversations — from the browser or terminal.
 
 ![Python 3.7+](https://img.shields.io/badge/python-3.7%2B-blue)
 ![No Dependencies](https://img.shields.io/badge/dependencies-none-green)
 ![Cross Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)
+[![PyPI](https://img.shields.io/pypi/v/claude-chats-and-analytics-viewer)](https://pypi.org/project/claude-chats-and-analytics-viewer/)
 
 ---
 
 ## One-command install & run
 
 ```bash
-pip install claude-conversation-viewer && ccv
+pip install claude-chats-and-analytics-viewer && ccv
 ```
 
 That's it. Opens `http://127.0.0.1:5005` in your browser.
@@ -20,10 +21,10 @@ That's it. Opens `http://127.0.0.1:5005` in your browser.
 
 ```bash
 # With pipx (no permanent install)
-pipx run claude-conversation-viewer
+pipx run claude-chats-and-analytics-viewer
 
 # With uv (fastest, no install needed)
-uvx claude-conversation-viewer
+uvx claude-chats-and-analytics-viewer
 
 # Shell script (auto install + launch)
 curl -fsSL https://raw.githubusercontent.com/AnshRajput/Claude-Conversation-viewer/main/install.sh | sh
