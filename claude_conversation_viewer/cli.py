@@ -391,10 +391,15 @@ def print_welcome(total: int):
         (f"{C.GOLD}q{C.RESET}",          "Quit",                       10),
     ]
     for cmd_str, desc, visible_len in cmds:
-        # visible_len is the visible character count of cmd_str (without ANSI)
         gap = 16 - visible_len
         line = f"    {cmd_str}{' ' * gap}{C.GRAY}{desc}{C.RESET}"
         print(f"  {C.LAVENDER}{Box.V}{C.RESET}{line}{' ' * (bw - 4 - 16 - len(desc))}{C.LAVENDER}{Box.V}{C.RESET}")
+    # Divider + restart tip
+    print(f"  {C.LAVENDER}{Box.L}{Box.H * bw}{Box.R}{C.RESET}")
+    tip = " Restart Web UI: run 'ccv'  |  Reopen browser: http://127.0.0.1:5005 "
+    tip_pad = bw - len(tip)
+    rpad = max(0, tip_pad)
+    print(f"  {C.LAVENDER}{Box.V}{C.RESET}{C.GRAY}{tip}{' ' * rpad}{C.RESET}{C.LAVENDER}{Box.V}{C.RESET}")
     # Bottom border
     print(f"  {C.LAVENDER}{Box.BL}{Box.H * bw}{Box.BR}{C.RESET}")
     print()
