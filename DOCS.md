@@ -106,7 +106,7 @@ This installs two commands:
 Clone the repository and install locally:
 
 ```bash
-git clone https://github.com/AnshRajput/Claude-Conversation-viewer.git
+git clone https://github.com/AnshRajput/claude-chats-and-analytics-viewer.git
 cd claude-conversation-viewer
 pip install .
 ```

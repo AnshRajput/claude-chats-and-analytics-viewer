@@ -27,7 +27,7 @@ pipx run claude-chats-and-analytics-viewer
 uvx claude-chats-and-analytics-viewer
 
 # Shell script (auto install + launch)
-curl -fsSL https://raw.githubusercontent.com/AnshRajput/Claude-Conversation-viewer/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/AnshRajput/claude-chats-and-analytics-viewer/main/install.sh | sh
 ```
 
 ---
@@ -93,4 +93,4 @@ ccv --update
 
 ## License
 
-MIT — [github.com/AnshRajput/Claude-Conversation-viewer](https://github.com/AnshRajput/Claude-Conversation-viewer)
+MIT — [github.com/AnshRajput/claude-chats-and-analytics-viewer](https://github.com/AnshRajput/claude-chats-and-analytics-viewer)

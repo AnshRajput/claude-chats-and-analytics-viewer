@@ -32,9 +32,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/AnshRajput/Claude-Conversation-viewer"
-Repository = "https://github.com/AnshRajput/Claude-Conversation-viewer"
-Issues = "https://github.com/AnshRajput/Claude-Conversation-viewer/issues"
+Homepage = "https://github.com/AnshRajput/claude-chats-and-analytics-viewer"
+Repository = "https://github.com/AnshRajput/claude-chats-and-analytics-viewer"
+Issues = "https://github.com/AnshRajput/claude-chats-and-analytics-viewer/issues"
 
 [project.scripts]
 claude-conversations = "claude_conversation_viewer.web:main"
