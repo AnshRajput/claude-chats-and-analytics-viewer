@@ -1,30 +1,24 @@
 #!/usr/bin/env python3
-"""
-Claude Code Conversation Viewer
-================================
-A single-file, zero-dependency GUI for browsing your Claude Code conversation history.
-
-Usage:
-    python3 claude_conversation_viewer.py [--port PORT] [--no-open]
-
-Requirements: Python 3.7+ (no pip install needed)
-Works on: macOS, Windows, Linux
-"""
+"""Claude Code Conversation Viewer - Web UI with full feature set."""
 
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import platform
 import re
 import sys
+import tempfile
 import threading
+import time
 import webbrowser
+import zipfile
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse, parse_qs
 
 try:
@@ -33,7 +27,25 @@ except ImportError:
     check_for_update_sync = None
 
 # ---------------------------------------------------------------------------
-# Path detection
+# Model pricing table  (input $/1M, output $/1M, cache_write $/1M, cache_read $/1M)
+# ---------------------------------------------------------------------------
+
+MODEL_PRICING: Dict[str, Tuple[float, float, float, float]] = {
+    "claude-opus-4":     (15.00, 75.00, 18.75, 1.50),
+    "claude-sonnet-4":   (3.00,  15.00, 3.75,  0.30),
+    "claude-haiku-4":    (0.80,  4.00,  1.00,  0.08),
+    "claude-3-7-sonnet": (3.00,  15.00, 3.75,  0.30),
+    "claude-3-5-sonnet": (3.00,  15.00, 3.75,  0.30),
+    "claude-3-5-haiku":  (0.80,  4.00,  1.00,  0.08),
+    "claude-3-opus":     (15.00, 75.00, 18.75, 1.50),
+    "claude-3-sonnet":   (3.00,  15.00, 3.75,  0.30),
+    "claude-3-haiku":    (0.25,  1.25,  0.30,  0.03),
+}
+
+CACHE_VERSION = 2
+
+# ---------------------------------------------------------------------------
+# Path helpers
 # ---------------------------------------------------------------------------
 
 def get_claude_dir() -> Path:
@@ -48,30 +60,106 @@ def get_projects_dir() -> Path:
     return get_claude_dir() / "projects"
 
 
+def get_cache_path() -> Path:
+    return Path(tempfile.gettempdir()) / "claude-viewer-cache-v2.json"
+
+
+def get_bookmarks_path() -> Path:
+    return get_claude_dir() / "viewer-bookmarks.json"
+
+
 def decode_project_slug(slug: str) -> str:
-    """Best-effort decode of project slug to path. The slug replaces / with -."""
-    # The slug is the cwd with / replaced by -
-    # We can't perfectly reverse it, but we use cwd from conversations when available
     return slug
+
+# ---------------------------------------------------------------------------
+# Cost estimation
+# ---------------------------------------------------------------------------
+
+def get_model_pricing(model_name: str) -> Tuple[float, float, float, float]:
+    if not model_name:
+        return (3.00, 15.00, 3.75, 0.30)
+    lower = model_name.lower()
+    for pattern, pricing in MODEL_PRICING.items():
+        if pattern in lower:
+            return pricing
+    return (3.00, 15.00, 3.75, 0.30)
+
+
+def estimate_cost(conv: dict) -> float:
+    models = conv.get("models", [])
+    pricing = get_model_pricing(models[0] if models else "")
+    cost = (
+        conv.get("total_input_tokens", 0) / 1_000_000 * pricing[0]
+        + conv.get("total_output_tokens", 0) / 1_000_000 * pricing[1]
+        + conv.get("total_cache_creation", 0) / 1_000_000 * pricing[2]
+        + conv.get("total_cache_read", 0) / 1_000_000 * pricing[3]
+    )
+    return round(cost, 4)
+
+# ---------------------------------------------------------------------------
+# Smart metadata cache
+# ---------------------------------------------------------------------------
+
+def load_metadata_cache() -> dict:
+    try:
+        p = get_cache_path()
+        if p.exists():
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if data.get("version") == CACHE_VERSION:
+                return data.get("entries", {})
+    except Exception:
+        pass
+    return {}
+
+
+def save_metadata_cache(entries: dict):
+    try:
+        get_cache_path().write_text(
+            json.dumps({"version": CACHE_VERSION, "entries": entries}),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+# ---------------------------------------------------------------------------
+# Bookmarks
+# ---------------------------------------------------------------------------
+
+def load_bookmarks() -> dict:
+    try:
+        p = get_bookmarks_path()
+        if p.exists():
+            data = json.loads(p.read_text(encoding="utf-8"))
+            return data.get("bookmarks", {})
+    except Exception:
+        pass
+    return {}
+
+
+def save_bookmarks(bookmarks: dict):
+    try:
+        p = get_bookmarks_path()
+        p.write_text(
+            json.dumps({"version": 1, "bookmarks": bookmarks}, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
 # JSONL parser
 # ---------------------------------------------------------------------------
 
-def parse_conversation_metadata(filepath: Path) -> dict | None:
-    """Fast scan: read only what we need for the list view."""
+def parse_conversation_metadata(filepath: Path) -> Optional[dict]:
     session_id = filepath.stem
     project_slug = filepath.parent.name
     title = None
+    preview = None
     first_timestamp = None
     last_timestamp = None
-    models = set()
-    total_input_tokens = 0
-    total_output_tokens = 0
-    total_cache_creation = 0
-    total_cache_read = 0
-    user_msg_count = 0
-    assistant_msg_count = 0
+    models: set = set()
+    total_input = total_output = total_cache_create = total_cache_read = 0
+    user_count = assistant_count = 0
     cwd = None
     version = None
 
@@ -98,58 +186,67 @@ def parse_conversation_metadata(filepath: Path) -> dict | None:
                 if role == "user" and obj.get("type") == "user":
                     content = msg.get("content", "")
                     if isinstance(content, str) and content and not content.startswith("<"):
-                        user_msg_count += 1
+                        user_count += 1
                         if title is None:
-                            title = content[:120]
+                            title = content[:80]
+                            preview = content[:220]
                         if cwd is None:
                             cwd = obj.get("cwd")
                         if version is None:
                             version = obj.get("version")
-                    elif isinstance(content, str) and content.startswith("<"):
-                        pass  # meta/command messages
-                    else:
-                        user_msg_count += 1
+                    elif isinstance(content, list):
+                        user_count += 1
+                        if title is None:
+                            for block in content:
+                                if isinstance(block, dict) and block.get("type") == "text":
+                                    text = block.get("text", "")
+                                    if text and not text.startswith("<"):
+                                        title = text[:80]
+                                        preview = text[:220]
+                                        break
 
                 elif role == "assistant":
-                    assistant_msg_count += 1
+                    assistant_count += 1
                     model = msg.get("model")
                     if model:
                         models.add(model)
                     usage = msg.get("usage", {})
-                    total_input_tokens += usage.get("input_tokens", 0)
-                    total_output_tokens += usage.get("output_tokens", 0)
-                    total_cache_creation += usage.get("cache_creation_input_tokens", 0)
+                    total_input += usage.get("input_tokens", 0)
+                    total_output += usage.get("output_tokens", 0)
+                    total_cache_create += usage.get("cache_creation_input_tokens", 0)
                     total_cache_read += usage.get("cache_read_input_tokens", 0)
 
     except (OSError, PermissionError):
         return None
 
-    if user_msg_count == 0 and assistant_msg_count == 0:
+    if user_count == 0 and assistant_count == 0:
         return None
 
-    return {
+    meta = {
         "id": session_id,
         "project": project_slug,
         "project_path": cwd or decode_project_slug(project_slug),
-        "title": title or "(no title)",
+        "title": title or "(untitled)",
+        "preview": preview or title or "(untitled)",
         "first_timestamp": first_timestamp,
         "last_timestamp": last_timestamp,
         "models": sorted(models),
-        "total_input_tokens": total_input_tokens,
-        "total_output_tokens": total_output_tokens,
-        "total_cache_creation": total_cache_creation,
+        "total_input_tokens": total_input,
+        "total_output_tokens": total_output,
+        "total_cache_creation": total_cache_create,
         "total_cache_read": total_cache_read,
-        "user_messages": user_msg_count,
-        "assistant_messages": assistant_msg_count,
-        "total_messages": user_msg_count + assistant_msg_count,
+        "user_messages": user_count,
+        "assistant_messages": assistant_count,
+        "total_messages": user_count + assistant_count,
         "cwd": cwd,
         "version": version,
         "file_path": str(filepath),
     }
+    meta["estimated_cost_usd"] = estimate_cost(meta)
+    return meta
 
 
-def parse_full_conversation(filepath: Path) -> list[dict]:
-    """Parse full conversation for the viewer."""
+def parse_full_conversation(filepath: Path) -> list:
     messages = []
     try:
         with open(filepath, "r", encoding="utf-8", errors="replace") as f:
@@ -164,24 +261,17 @@ def parse_full_conversation(filepath: Path) -> list[dict]:
 
                 msg = obj.get("message", {})
                 role = msg.get("role")
-                msg_type = obj.get("type")
 
                 if role not in ("user", "assistant"):
                     continue
-
-                # Skip meta/command messages for cleaner view
                 if role == "user" and obj.get("isMeta"):
                     continue
 
                 content = msg.get("content", "")
-
-                # Skip command messages
-                if isinstance(content, str) and content.strip().startswith("<command-name>"):
-                    continue
-                if isinstance(content, str) and content.strip().startswith("<local-command"):
+                if isinstance(content, str) and content.strip().startswith(("<command-name>", "<local-command")):
                     continue
 
-                entry = {
+                entry: dict = {
                     "role": role,
                     "timestamp": obj.get("timestamp"),
                     "uuid": obj.get("uuid"),
@@ -196,8 +286,16 @@ def parse_full_conversation(filepath: Path) -> list[dict]:
                         "cache_creation": usage.get("cache_creation_input_tokens", 0),
                         "cache_read": usage.get("cache_read_input_tokens", 0),
                     }
+                    pricing = get_model_pricing(entry.get("model") or "")
+                    u = entry["usage"]
+                    entry["estimated_cost_usd"] = round(
+                        u["input_tokens"] / 1e6 * pricing[0]
+                        + u["output_tokens"] / 1e6 * pricing[1]
+                        + u["cache_creation"] / 1e6 * pricing[2]
+                        + u["cache_read"] / 1e6 * pricing[3],
+                        6,
+                    )
 
-                # Process content
                 if isinstance(content, str):
                     if content and not content.startswith("<"):
                         entry["content"] = [{"type": "text", "text": content}]
@@ -206,35 +304,34 @@ def parse_full_conversation(filepath: Path) -> list[dict]:
                 elif isinstance(content, list):
                     blocks = []
                     for block in content:
-                        if isinstance(block, dict):
-                            btype = block.get("type")
-                            if btype == "text":
-                                text = block.get("text", "")
-                                if text and not text.startswith("<system-reminder>"):
-                                    blocks.append({"type": "text", "text": text})
-                            elif btype == "tool_use":
-                                blocks.append({
-                                    "type": "tool_use",
-                                    "name": block.get("name", "unknown"),
-                                    "id": block.get("id", ""),
-                                    "input": block.get("input", {}),
-                                })
-                            elif btype == "tool_result":
-                                result_content = block.get("content", "")
-                                if isinstance(result_content, list):
-                                    texts = []
-                                    for rc in result_content:
-                                        if isinstance(rc, dict) and rc.get("type") == "text":
-                                            texts.append(rc.get("text", ""))
-                                    result_content = "\n".join(texts)
-                                blocks.append({
-                                    "type": "tool_result",
-                                    "tool_use_id": block.get("tool_use_id", ""),
-                                    "content": str(result_content)[:5000],
-                                })
-                        elif isinstance(block, str):
-                            if block and not block.startswith("<"):
+                        if not isinstance(block, dict):
+                            if isinstance(block, str) and block and not block.startswith("<"):
                                 blocks.append({"type": "text", "text": block})
+                            continue
+                        btype = block.get("type")
+                        if btype == "text":
+                            text = block.get("text", "")
+                            if text and not text.startswith("<system-reminder>"):
+                                blocks.append({"type": "text", "text": text})
+                        elif btype == "tool_use":
+                            blocks.append({
+                                "type": "tool_use",
+                                "name": block.get("name", "unknown"),
+                                "id": block.get("id", ""),
+                                "input": block.get("input", {}),
+                            })
+                        elif btype == "tool_result":
+                            rc = block.get("content", "")
+                            if isinstance(rc, list):
+                                rc = "\n".join(
+                                    x.get("text", "") for x in rc
+                                    if isinstance(x, dict) and x.get("type") == "text"
+                                )
+                            blocks.append({
+                                "type": "tool_result",
+                                "tool_use_id": block.get("tool_use_id", ""),
+                                "content": str(rc)[:5000],
+                            })
                     if blocks:
                         entry["content"] = blocks
                     else:
@@ -251,90 +348,121 @@ def parse_full_conversation(filepath: Path) -> list[dict]:
 
 
 def export_as_markdown(filepath: Path, metadata: dict) -> str:
-    """Export a conversation as a markdown file."""
     messages = parse_full_conversation(filepath)
-    lines = []
-    lines.append(f"# {metadata.get('title', 'Conversation')}")
-    lines.append("")
-    lines.append(f"**Session ID:** {metadata['id']}")
-    lines.append(f"**Project:** {metadata['project_path']}")
-    lines.append(f"**Date:** {metadata.get('first_timestamp', 'Unknown')}")
+    lines = [
+        f"# {metadata.get('title', 'Conversation')}",
+        "",
+        f"**Session ID:** {metadata['id']}",
+        f"**Project:** {metadata['project_path']}",
+        f"**Date:** {metadata.get('first_timestamp', 'Unknown')}",
+    ]
     if metadata.get("models"):
         lines.append(f"**Model(s):** {', '.join(metadata['models'])}")
-    lines.append(f"**Messages:** {metadata['total_messages']}")
-    lines.append("")
-    lines.append("---")
-    lines.append("")
+    lines += [f"**Messages:** {metadata['total_messages']}", "", "---", ""]
 
     for msg in messages:
         role_label = "**User**" if msg["role"] == "user" else "**Assistant**"
         ts = msg.get("timestamp", "")
         lines.append(f"### {role_label} {('(' + ts + ')') if ts else ''}")
         lines.append("")
-
         for block in msg.get("content", []):
             btype = block.get("type")
             if btype == "text":
                 lines.append(block["text"])
             elif btype == "tool_use":
-                lines.append(f"<details><summary>Tool: {block['name']}</summary>")
-                lines.append("")
-                lines.append("```json")
-                lines.append(json.dumps(block.get("input", {}), indent=2)[:3000])
-                lines.append("```")
-                lines.append("</details>")
+                lines += [
+                    f"<details><summary>Tool: {block['name']}</summary>",
+                    "",
+                    "```json",
+                    json.dumps(block.get("input", {}), indent=2)[:3000],
+                    "```",
+                    "</details>",
+                ]
             elif btype == "tool_result":
-                lines.append(f"<details><summary>Tool Result</summary>")
-                lines.append("")
-                lines.append("```")
-                lines.append(str(block.get("content", ""))[:3000])
-                lines.append("```")
-                lines.append("</details>")
+                lines += [
+                    "<details><summary>Tool Result</summary>",
+                    "",
+                    "```",
+                    str(block.get("content", ""))[:3000],
+                    "```",
+                    "</details>",
+                ]
             lines.append("")
-
-        lines.append("---")
-        lines.append("")
+        lines += ["---", ""]
 
     return "\n".join(lines)
 
 # ---------------------------------------------------------------------------
-# Data store (built on startup)
+# Data store
 # ---------------------------------------------------------------------------
 
 class ConversationStore:
     def __init__(self):
-        self.conversations: list[dict] = []
-        self.by_id: dict[str, dict] = {}
-        self.projects: list[str] = []
-        self._file_map: dict[str, Path] = {}
+        self.conversations: List[dict] = []
+        self.by_id: Dict[str, dict] = {}
+        self.projects: List[str] = []
+        self._file_map: Dict[str, Path] = {}
+        self.bookmarks: Dict[str, bool] = {}
+        self.last_scanned: float = 0
 
     def load(self):
         projects_dir = get_projects_dir()
         if not projects_dir.exists():
             print(f"[WARN] Claude projects directory not found: {projects_dir}")
+            self.last_scanned = time.time()
             return
 
-        print(f"[INFO] Scanning {projects_dir} ...")
-        count = 0
-        for project_dir in sorted(projects_dir.iterdir()):
-            if not project_dir.is_dir():
-                continue
-            if project_dir.name.startswith("."):
-                continue
-            for jsonl_file in sorted(project_dir.glob("*.jsonl")):
-                meta = parse_conversation_metadata(jsonl_file)
-                if meta:
-                    self.conversations.append(meta)
-                    self.by_id[meta["id"]] = meta
-                    self._file_map[meta["id"]] = jsonl_file
-                    count += 1
+        cache = load_metadata_cache()
+        new_cache: dict = {}
+        parsed = 0
+        cache_hits = 0
 
-        # Sort newest first
-        self.conversations.sort(
-            key=lambda c: c.get("last_timestamp") or "", reverse=True
+        all_files: List[Path] = []
+        for project_dir in sorted(projects_dir.iterdir()):
+            if not project_dir.is_dir() or project_dir.name.startswith("."):
+                continue
+            all_files.extend(sorted(project_dir.glob("*.jsonl")))
+
+        conversations: List[dict] = []
+        file_map: Dict[str, Path] = {}
+
+        for jsonl_file in all_files:
+            file_key = str(jsonl_file)
+            try:
+                stat = jsonl_file.stat()
+                mtime = stat.st_mtime
+                size = stat.st_size
+            except OSError:
+                continue
+
+            cached = cache.get(file_key)
+            if cached and cached.get("mtime") == mtime and cached.get("size") == size:
+                meta = cached["metadata"]
+                cache_hits += 1
+            else:
+                meta = parse_conversation_metadata(jsonl_file)
+                parsed += 1
+
+            if meta:
+                new_cache[file_key] = {"mtime": mtime, "size": size, "metadata": meta}
+                conversations.append(meta)
+                file_map[meta["id"]] = jsonl_file
+
+        conversations.sort(key=lambda c: c.get("last_timestamp") or "", reverse=True)
+
+        self.conversations = conversations
+        self.by_id = {c["id"]: c for c in conversations}
+        self._file_map = file_map
+        self.projects = sorted(set(c["project"] for c in conversations))
+        self.bookmarks = load_bookmarks()
+        self.last_scanned = time.time()
+
+        save_metadata_cache(new_cache)
+        total = len(conversations)
+        print(
+            f"[INFO] {total} conversations ({cache_hits} cached, {parsed} parsed) "
+            f"from {len(self.projects)} projects"
         )
-        self.projects = sorted(set(c["project"] for c in self.conversations))
-        print(f"[INFO] Loaded {count} conversations from {len(self.projects)} projects")
 
     def get_stats(self) -> dict:
         total_input = sum(c["total_input_tokens"] for c in self.conversations)
@@ -342,16 +470,24 @@ class ConversationStore:
         total_cache_create = sum(c["total_cache_creation"] for c in self.conversations)
         total_cache_read = sum(c["total_cache_read"] for c in self.conversations)
         total_messages = sum(c["total_messages"] for c in self.conversations)
+        total_cost = sum(c.get("estimated_cost_usd", 0) for c in self.conversations)
 
-        model_counts: dict[str, int] = {}
+        model_counts: Dict[str, int] = {}
         for c in self.conversations:
             for m in c["models"]:
                 model_counts[m] = model_counts.get(m, 0) + 1
 
-        project_counts: dict[str, int] = {}
+        project_counts: Dict[str, int] = {}
         for c in self.conversations:
             p = c["project_path"]
             project_counts[p] = project_counts.get(p, 0) + 1
+
+        daily_activity: Dict[str, int] = {}
+        for c in self.conversations:
+            ts = c.get("first_timestamp")
+            if ts and len(ts) >= 10:
+                day = ts[:10]
+                daily_activity[day] = daily_activity.get(day, 0) + 1
 
         return {
             "total_conversations": len(self.conversations),
@@ -362,9 +498,57 @@ class ConversationStore:
             "total_cache_creation_tokens": total_cache_create,
             "total_cache_read_tokens": total_cache_read,
             "total_tokens": total_input + total_output + total_cache_create + total_cache_read,
+            "total_cost_usd": round(total_cost, 4),
             "model_usage": dict(sorted(model_counts.items(), key=lambda x: -x[1])),
             "project_counts": dict(sorted(project_counts.items(), key=lambda x: -x[1])),
+            "daily_activity": daily_activity,
         }
+
+    def search_content(self, query: str) -> List[dict]:
+        results = []
+        query_lower = query.lower()
+        for conv in self.conversations:
+            filepath = self._file_map.get(conv["id"])
+            if not filepath:
+                continue
+            try:
+                with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        try:
+                            obj = json.loads(line.strip())
+                            msg = obj.get("message", {})
+                            content = msg.get("content", "")
+                            if isinstance(content, str):
+                                text = content
+                            elif isinstance(content, list):
+                                text = " ".join(
+                                    b.get("text", "") for b in content
+                                    if isinstance(b, dict) and b.get("type") == "text"
+                                )
+                            else:
+                                continue
+
+                            if query_lower in text.lower():
+                                idx = text.lower().find(query_lower)
+                                start = max(0, idx - 60)
+                                end = min(len(text), idx + len(query) + 100)
+                                prefix = "…" if start > 0 else ""
+                                suffix = "…" if end < len(text) else ""
+                                snippet = prefix + text[start:end] + suffix
+                                results.append({
+                                    "id": conv["id"],
+                                    "title": conv["title"],
+                                    "project_path": conv.get("project_path", ""),
+                                    "first_timestamp": conv.get("first_timestamp"),
+                                    "snippet": snippet[:300],
+                                    "bookmarked": conv["id"] in self.bookmarks,
+                                })
+                                break
+                        except (json.JSONDecodeError, AttributeError):
+                            continue
+            except (OSError, PermissionError):
+                pass
+        return results
 
 
 STORE = ConversationStore()
@@ -375,17 +559,18 @@ STORE = ConversationStore()
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        pass  # Suppress default logging
+        pass
 
-    def _json_response(self, data, status=200):
+    def _json(self, data, status=200):
         body = json.dumps(data).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
 
-    def _html_response(self, html):
+    def _html(self, html: str):
         body = html.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -393,14 +578,13 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _download_response(self, content, filename, content_type="text/markdown"):
-        body = content.encode("utf-8")
+    def _download(self, content: bytes, filename: str, content_type: str):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(len(content)))
         self.end_headers()
-        self.wfile.write(body)
+        self.wfile.write(content)
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -408,23 +592,24 @@ class Handler(BaseHTTPRequestHandler):
         params = parse_qs(parsed.query)
 
         if path == "/":
-            self._html_response(HTML_PAGE)
+            self._html(HTML_PAGE)
 
         elif path == "/api/conversations":
-            self._json_response({
-                "conversations": STORE.conversations,
-                "projects": STORE.projects,
-            })
+            convs = [
+                {**c, "bookmarked": c["id"] in STORE.bookmarks}
+                for c in STORE.conversations
+            ]
+            self._json({"conversations": convs, "projects": STORE.projects})
 
         elif path.startswith("/api/conversation/"):
             conv_id = path.split("/")[-1]
             if conv_id not in STORE.by_id:
-                self._json_response({"error": "Not found"}, 404)
+                self._json({"error": "Not found"}, 404)
                 return
             filepath = STORE._file_map[conv_id]
             messages = parse_full_conversation(filepath)
-            self._json_response({
-                "metadata": STORE.by_id[conv_id],
+            self._json({
+                "metadata": {**STORE.by_id[conv_id], "bookmarked": conv_id in STORE.bookmarks},
                 "messages": messages,
             })
 
@@ -432,29 +617,121 @@ class Handler(BaseHTTPRequestHandler):
             conv_id = path.split("/")[-1]
             fmt = params.get("format", ["md"])[0]
             if conv_id not in STORE.by_id:
-                self._json_response({"error": "Not found"}, 404)
+                self._json({"error": "Not found"}, 404)
                 return
             filepath = STORE._file_map[conv_id]
             meta = STORE.by_id[conv_id]
             if fmt == "json":
-                messages = parse_full_conversation(filepath)
-                content = json.dumps({"metadata": meta, "messages": messages}, indent=2)
-                self._download_response(content, f"{conv_id}.json", "application/json")
+                msgs = parse_full_conversation(filepath)
+                content = json.dumps({"metadata": meta, "messages": msgs}, indent=2).encode("utf-8")
+                self._download(content, f"{conv_id}.json", "application/json")
             else:
                 md = export_as_markdown(filepath, meta)
-                self._download_response(md, f"{conv_id}.md")
+                self._download(md.encode("utf-8"), f"{conv_id}.md", "text/markdown")
+
+        elif path == "/api/export-all":
+            fmt = params.get("format", ["md"])[0]
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for conv_id, filepath in STORE._file_map.items():
+                    meta = STORE.by_id[conv_id]
+                    try:
+                        if fmt == "json":
+                            msgs = parse_full_conversation(filepath)
+                            content = json.dumps({"metadata": meta, "messages": msgs}, indent=2)
+                            zf.writestr(f"{conv_id}.json", content)
+                        else:
+                            zf.writestr(f"{conv_id}.md", export_as_markdown(filepath, meta))
+                    except Exception:
+                        continue
+            zip_bytes = buf.getvalue()
+            self._download(zip_bytes, f"claude-conversations.zip", "application/zip")
 
         elif path == "/api/stats":
-            self._json_response(STORE.get_stats())
+            self._json(STORE.get_stats())
+
+        elif path == "/api/search":
+            query = params.get("q", [""])[0].strip()
+            if len(query) < 2:
+                self._json({"results": [], "query": query})
+                return
+            results = STORE.search_content(query)
+            self._json({"results": results, "query": query})
+
+        elif path == "/api/bookmarks":
+            bookmarked_ids = list(STORE.bookmarks.keys())
+            convs = [
+                {**STORE.by_id[bid], "bookmarked": True}
+                for bid in bookmarked_ids
+                if bid in STORE.by_id
+            ]
+            convs.sort(key=lambda c: c.get("last_timestamp") or "", reverse=True)
+            self._json({"bookmarks": convs})
+
+        elif path == "/api/status":
+            self._json({
+                "count": len(STORE.conversations),
+                "last_scanned": STORE.last_scanned,
+            })
+
+        elif path == "/api/refresh":
+            old_count = len(STORE.conversations)
+            STORE.load()
+            new_count = len(STORE.conversations)
+            convs = [
+                {**c, "bookmarked": c["id"] in STORE.bookmarks}
+                for c in STORE.conversations
+            ]
+            self._json({
+                "total": new_count,
+                "new_count": new_count - old_count,
+                "conversations": convs,
+                "projects": STORE.projects,
+            })
 
         elif path == "/api/update-check":
             if check_for_update_sync is not None:
-                self._json_response(check_for_update_sync())
+                self._json(check_for_update_sync())
             else:
-                self._json_response({"update_available": False})
+                self._json({"update_available": False})
 
         else:
-            self._json_response({"error": "Not found"}, 404)
+            self._json({"error": "Not found"}, 404)
+
+    def do_POST(self):
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
+        try:
+            data = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            data = {}
+
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == "/api/bookmarks":
+            session_id = data.get("id", "").strip()
+            bookmarked = data.get("bookmarked", True)
+            if not session_id:
+                self._json({"error": "Missing id"}, 400)
+                return
+            bookmarks = load_bookmarks()
+            if bookmarked:
+                bookmarks[session_id] = True
+            else:
+                bookmarks.pop(session_id, None)
+            save_bookmarks(bookmarks)
+            STORE.bookmarks = bookmarks
+            self._json({"ok": True, "bookmarked": bookmarked})
+        else:
+            self._json({"error": "Not found"}, 404)
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
 
 # ---------------------------------------------------------------------------
 # Embedded Frontend
@@ -465,7 +742,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Claude Code Conversations</title>
+<title>Claude Conversations</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.1/marked.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
@@ -473,151 +751,243 @@ HTML_PAGE = r"""<!DOCTYPE html>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
-  --bg: #0d1117;
-  --bg-secondary: #161b22;
-  --bg-tertiary: #1c2128;
-  --border: #30363d;
-  --text: #e6edf3;
-  --text-muted: #8b949e;
-  --accent: #c084fc;
-  --accent-dim: rgba(192, 132, 252, 0.15);
-  --user-bg: #1a1f2e;
-  --assistant-bg: #161b22;
-  --success: #3fb950;
-  --warning: #d29922;
+  --bg:            #080b10;
+  --bg-surface:    #0f1318;
+  --bg-raised:     #161b24;
+  --bg-elevated:   #1c2333;
+  --border:        #21262e;
+  --border-subtle: #181c24;
+  --text:          #e2e8f0;
+  --text-muted:    #64748b;
+  --text-faint:    #374151;
+  --accent:        #8b5cf6;
+  --accent-bright: #a78bfa;
+  --accent-dim:    rgba(139, 92, 246, 0.12);
+  --accent-glow:   rgba(139, 92, 246, 0.06);
+  --indigo:        #6366f1;
+  --indigo-dim:    rgba(99, 102, 241, 0.12);
+  --green:         #22c55e;
+  --green-dim:     rgba(34, 197, 94, 0.1);
+  --yellow:        #eab308;
+  --yellow-dim:    rgba(234, 179, 8, 0.1);
+  --red:           #ef4444;
+  --cyan:          #22d3ee;
+  --user-bg:       rgba(99, 102, 241, 0.07);
+  --user-border:   rgba(99, 102, 241, 0.18);
+  --asst-border:   rgba(139, 92, 246, 0.12);
+  --radius:        10px;
+  --radius-sm:     6px;
+  --radius-xs:     4px;
+  --shadow:        0 4px 24px rgba(0,0,0,0.4);
+  --shadow-sm:     0 2px 8px rgba(0,0,0,0.3);
 }
 
 body {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif;
   background: var(--bg);
   color: var(--text);
   height: 100vh;
   overflow: hidden;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
 }
 
-.app {
-  display: flex;
-  height: 100vh;
-}
+/* ── Layout ── */
+.app { display: flex; height: 100vh; }
 
-/* ---- Sidebar ---- */
+/* ── Sidebar ── */
 .sidebar {
-  width: 360px;
-  min-width: 360px;
-  background: var(--bg-secondary);
+  width: 340px;
+  min-width: 340px;
+  background: var(--bg-surface);
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
   height: 100vh;
+  position: relative;
 }
 
 .sidebar-header {
-  padding: 16px;
-  border-bottom: 1px solid var(--border);
+  padding: 14px 14px 10px;
+  border-bottom: 1px solid var(--border-subtle);
+  flex-shrink: 0;
 }
 
-.sidebar-header h1 {
-  font-size: 16px;
-  font-weight: 600;
-  margin-bottom: 12px;
+.brand {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 9px;
+  margin-bottom: 12px;
 }
 
-.sidebar-header h1 .logo {
-  color: var(--accent);
+.brand-icon {
+  width: 30px;
+  height: 30px;
+  background: linear-gradient(135deg, var(--accent) 0%, #c084fc 100%);
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  flex-shrink: 0;
+  box-shadow: 0 2px 8px rgba(139,92,246,0.35);
 }
+
+.brand-text { font-size: 14px; font-weight: 600; letter-spacing: -0.01em; }
+.brand-sub { font-size: 11px; color: var(--text-muted); font-weight: 400; }
+
+.brand-actions { margin-left: auto; display: flex; gap: 6px; }
+
+.icon-btn {
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--border);
+  background: var(--bg-raised);
+  color: var(--text-muted);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  transition: all 0.15s;
+  flex-shrink: 0;
+}
+.icon-btn:hover { background: var(--bg-elevated); color: var(--text); border-color: var(--accent); }
+.icon-btn.active { background: var(--accent-dim); color: var(--accent-bright); border-color: var(--accent); }
 
 .tabs {
   display: flex;
-  gap: 4px;
-  margin-bottom: 12px;
+  gap: 3px;
+  background: var(--bg-raised);
+  padding: 3px;
+  border-radius: var(--radius-sm);
+  margin-bottom: 10px;
 }
 
 .tab-btn {
   flex: 1;
-  padding: 6px 12px;
-  border: 1px solid var(--border);
+  padding: 5px 8px;
+  border: none;
   background: transparent;
   color: var(--text-muted);
-  border-radius: 6px;
+  border-radius: 5px;
   cursor: pointer;
-  font-size: 13px;
+  font-size: 12px;
+  font-weight: 500;
   transition: all 0.15s;
+  white-space: nowrap;
 }
+.tab-btn.active { background: var(--bg-elevated); color: var(--text); box-shadow: var(--shadow-sm); }
+.tab-btn:hover:not(.active) { color: var(--text); }
 
-.tab-btn.active {
-  background: var(--accent-dim);
-  color: var(--accent);
-  border-color: var(--accent);
-}
+.search-wrap { position: relative; margin-bottom: 8px; }
 
-.tab-btn:hover:not(.active) {
-  background: var(--bg-tertiary);
-  color: var(--text);
+.search-icon {
+  position: absolute;
+  left: 9px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-muted);
+  font-size: 13px;
+  pointer-events: none;
 }
 
 .search-box {
   width: 100%;
-  padding: 8px 12px;
-  background: var(--bg);
+  padding: 7px 32px 7px 30px;
+  background: var(--bg-raised);
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   color: var(--text);
   font-size: 13px;
   outline: none;
+  transition: border-color 0.15s, background 0.15s;
 }
+.search-box:focus { border-color: var(--accent); background: var(--bg-elevated); }
+.search-box::placeholder { color: var(--text-faint); }
 
-.search-box:focus {
-  border-color: var(--accent);
+.search-mode-toggle {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  padding: 2px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-muted);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s;
+  letter-spacing: 0.02em;
 }
+.search-mode-toggle:hover { color: var(--accent); border-color: var(--accent); }
+.search-mode-toggle.active { background: var(--accent-dim); color: var(--accent-bright); border-color: var(--accent); }
 
-.search-box::placeholder { color: var(--text-muted); }
-
-.filter-row {
-  display: flex;
-  gap: 8px;
-  margin-top: 8px;
-}
+.filter-row { display: flex; gap: 6px; }
 
 .filter-select {
+  flex: 1;
   min-width: 0;
-  padding: 6px 8px;
-  background: var(--bg);
+  padding: 5px 8px;
+  background: var(--bg-raised);
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   color: var(--text);
   font-size: 12px;
   outline: none;
+  cursor: pointer;
+  transition: border-color 0.15s;
 }
+.filter-select:focus { border-color: var(--accent); }
 
-#projectFilter { flex: 1.2; }
-#sortSelect { flex: 0.8; }
-
-.conv-list {
-  flex: 1;
-  overflow-y: auto;
-  padding: 8px;
-}
+/* ── Conversation list ── */
+.conv-list { flex: 1; overflow-y: auto; padding: 6px; }
 
 .conv-item {
-  padding: 10px 12px;
-  border-radius: 8px;
+  padding: 10px 11px;
+  border-radius: var(--radius-sm);
   cursor: pointer;
   border: 1px solid transparent;
-  margin-bottom: 4px;
-  transition: all 0.15s;
+  margin-bottom: 2px;
+  transition: all 0.12s;
+  position: relative;
+}
+.conv-item:hover { background: var(--bg-raised); border-color: var(--border); }
+.conv-item.active { background: var(--accent-dim); border-color: rgba(139,92,246,0.3); }
+.conv-item.active:hover { background: var(--accent-dim); }
+
+.conv-item-top { display: flex; align-items: flex-start; gap: 6px; margin-bottom: 2px; }
+
+.conv-project {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--accent-bright);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  flex: 1;
+  min-width: 0;
 }
 
-.conv-item:hover {
-  background: var(--bg-tertiary);
+.bookmark-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--text-faint);
+  font-size: 13px;
+  padding: 0;
+  line-height: 1;
+  flex-shrink: 0;
+  transition: color 0.15s, transform 0.1s;
 }
-
-.conv-item.active {
-  background: var(--accent-dim);
-  border-color: var(--accent);
-}
+.bookmark-btn:hover { color: var(--yellow); transform: scale(1.15); }
+.bookmark-btn.bookmarked { color: var(--yellow); }
 
 .conv-title {
   font-size: 13px;
@@ -625,74 +995,134 @@ body {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  margin-bottom: 4px;
+  margin-bottom: 3px;
+  color: var(--text);
+  line-height: 1.3;
+}
+
+.conv-preview {
+  font-size: 12px;
+  color: var(--text-muted);
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  line-height: 1.4;
+  margin-bottom: 5px;
+  word-break: break-word;
 }
 
 .conv-meta {
   display: flex;
-  gap: 8px;
+  align-items: center;
+  gap: 6px;
   font-size: 11px;
   color: var(--text-muted);
   flex-wrap: wrap;
 }
 
-.conv-meta span {
-  display: flex;
-  align-items: center;
-  gap: 3px;
-}
+.meta-sep { color: var(--text-faint); }
 
-.badge {
-  display: inline-block;
-  padding: 1px 6px;
+.cost-badge {
+  color: var(--green);
+  font-size: 10px;
+  font-weight: 600;
+  background: var(--green-dim);
+  padding: 1px 5px;
   border-radius: 10px;
-  font-size: 10px;
-  font-weight: 500;
-  background: var(--bg-tertiary);
-  border: 1px solid var(--border);
+  border: 1px solid rgba(34,197,94,0.2);
 }
 
-.conv-id {
+.model-badge {
+  color: var(--accent-bright);
   font-size: 10px;
-  font-family: monospace;
-  color: var(--text-muted);
-  opacity: 0.7;
+  background: var(--accent-dim);
+  padding: 1px 5px;
+  border-radius: 10px;
+  border: 1px solid rgba(139,92,246,0.2);
+  max-width: 110px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  margin-bottom: 3px;
 }
 
-.conv-project {
+.search-snippet {
   font-size: 11px;
-  color: var(--accent);
-  opacity: 0.8;
-  white-space: nowrap;
+  color: var(--text-muted);
+  background: var(--bg-raised);
+  border-left: 2px solid var(--accent);
+  padding: 4px 8px;
+  border-radius: 0 4px 4px 0;
+  margin-top: 4px;
+  font-style: italic;
   overflow: hidden;
-  text-overflow: ellipsis;
-  margin-bottom: 2px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
 }
 
-/* ---- Main panel ---- */
+/* ── Refresh banner ── */
+.refresh-banner {
+  background: var(--indigo-dim);
+  border-bottom: 1px solid rgba(99,102,241,0.3);
+  padding: 7px 12px;
+  font-size: 12px;
+  display: none;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.refresh-banner.show { display: flex; }
+.refresh-banner button {
+  margin-left: auto;
+  padding: 2px 10px;
+  font-size: 11px;
+  background: var(--indigo);
+  border: none;
+  color: white;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: 500;
+}
+.refresh-banner button:hover { opacity: 0.85; }
+
+/* ── Main panel ── */
 .main {
   flex: 1;
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  background: var(--bg);
+  min-width: 0;
 }
 
 .main-header {
-  padding: 0;
   border-bottom: 1px solid var(--border);
-  background: var(--bg-secondary);
+  background: var(--bg-surface);
+  flex-shrink: 0;
 }
 
 .main-header-top {
   display: flex;
   align-items: center;
-  padding: 10px 20px;
-  min-height: 48px;
+  padding: 10px 18px;
+  gap: 10px;
+  min-height: 50px;
 }
+
+.back-btn {
+  display: none;
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-raised);
+  color: var(--text-muted);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 12px;
+  flex-shrink: 0;
+  transition: all 0.15s;
+}
+.back-btn:hover { color: var(--text); border-color: var(--accent); }
 
 .main-header-title {
   font-size: 14px;
@@ -701,75 +1131,339 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   flex: 1;
+  min-width: 0;
+  letter-spacing: -0.01em;
 }
 
-.main-header-actions {
-  display: flex;
-  gap: 8px;
-  flex-shrink: 0;
-}
+.main-header-actions { display: flex; gap: 6px; flex-shrink: 0; }
 
 .main-header-session {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 20px 8px;
-  border-top: 1px solid var(--border);
-  background: var(--bg-tertiary);
+  padding: 6px 18px 8px;
+  background: var(--bg-raised);
+  border-top: 1px solid var(--border-subtle);
   font-size: 12px;
   flex-wrap: wrap;
 }
 
-.session-label {
-  color: var(--text-muted);
-  font-size: 11px;
-  flex-shrink: 0;
-}
+.session-label { color: var(--text-muted); font-size: 11px; flex-shrink: 0; }
 
 .session-id {
-  font-family: monospace;
-  font-size: 12px;
-  color: var(--cyan, #79c0ff);
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-size: 11.5px;
+  color: var(--cyan);
   background: var(--bg);
   padding: 2px 8px;
-  border-radius: 4px;
+  border-radius: var(--radius-xs);
   border: 1px solid var(--border);
   user-select: all;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   min-width: 0;
+  max-width: 320px;
 }
 
-.btn-sm {
-  padding: 3px 10px;
-  font-size: 11px;
-  flex-shrink: 0;
-}
-
+/* ── Buttons ── */
 .btn {
-  padding: 6px 14px;
+  padding: 5px 12px;
   border: 1px solid var(--border);
-  background: var(--bg-tertiary);
+  background: var(--bg-raised);
   color: var(--text);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   cursor: pointer;
   font-size: 12px;
+  font-weight: 500;
   transition: all 0.15s;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
+.btn:hover { background: var(--bg-elevated); border-color: var(--accent); color: var(--accent-bright); }
+.btn.btn-primary { background: var(--accent); border-color: var(--accent); color: white; }
+.btn.btn-primary:hover { background: #7c3aed; border-color: #7c3aed; color: white; }
+.btn.btn-sm { padding: 3px 9px; font-size: 11px; }
+.btn.btn-icon { padding: 5px 8px; }
+.btn.bookmarked-active { background: var(--yellow-dim); border-color: rgba(234,179,8,0.3); color: var(--yellow); }
 
-.btn:hover {
-  background: var(--accent-dim);
-  border-color: var(--accent);
-  color: var(--accent);
-}
-
+/* ── Messages ── */
 .messages-container {
   flex: 1;
   overflow-y: auto;
-  padding: 20px;
+  padding: 24px 28px;
 }
 
+.message {
+  margin-bottom: 20px;
+  max-width: 860px;
+  border-radius: var(--radius);
+  border: 1px solid transparent;
+  padding: 16px 20px;
+}
+
+.message.user {
+  background: var(--user-bg);
+  border-color: var(--user-border);
+}
+
+.message.assistant {
+  background: var(--bg-surface);
+  border-color: var(--asst-border);
+}
+
+.message-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+  gap: 8px;
+}
+
+.message-role-wrap { display: flex; align-items: center; gap: 7px; }
+
+.message-role {
+  font-weight: 700;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 2px 7px;
+  border-radius: 4px;
+}
+.message.user .message-role { color: var(--indigo); background: var(--indigo-dim); }
+.message.assistant .message-role { color: var(--accent-bright); background: var(--accent-dim); }
+
+.message-model { font-size: 11px; color: var(--text-muted); }
+
+.message-meta-right { display: flex; align-items: center; gap: 8px; }
+
+.token-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 7px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.msg-cost-badge {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--green);
+  background: var(--green-dim);
+  padding: 2px 6px;
+  border-radius: 10px;
+  border: 1px solid rgba(34,197,94,0.2);
+}
+
+.message-time { color: var(--text-faint); font-size: 11px; }
+
+/* ── Message body ── */
+.message-body { font-size: 14px; line-height: 1.65; color: var(--text); }
+.message-body p { margin-bottom: 10px; }
+.message-body p:last-child { margin-bottom: 0; }
+
+.message-body pre {
+  background: #0d1117;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 14px 16px;
+  overflow-x: auto;
+  margin: 10px 0;
+  font-size: 13px;
+  position: relative;
+}
+
+.copy-btn {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  padding: 2px 8px;
+  font-size: 10.5px;
+  font-weight: 500;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  color: var(--text-muted);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s, color 0.15s, border-color 0.15s;
+  font-family: inherit;
+}
+pre:hover .copy-btn { opacity: 1; }
+.copy-btn:hover { color: var(--accent-bright); border-color: var(--accent); }
+.copy-btn.copied { color: var(--green); border-color: var(--green); opacity: 1; }
+
+.message-body code {
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  background: var(--bg-elevated);
+  padding: 2px 5px;
+  border-radius: var(--radius-xs);
+  font-size: 12.5px;
+  border: 1px solid var(--border-subtle);
+  color: var(--accent-bright);
+}
+.message-body pre code { background: none; padding: 0; border: none; font-size: 13px; color: inherit; }
+
+.message-body ul, .message-body ol { margin: 8px 0 8px 22px; }
+.message-body li { margin-bottom: 4px; }
+
+.message-body blockquote {
+  border-left: 3px solid var(--accent);
+  padding-left: 14px;
+  color: var(--text-muted);
+  margin: 10px 0;
+  font-style: italic;
+}
+
+.message-body h1, .message-body h2 { margin: 18px 0 8px; font-size: 1.15em; }
+.message-body h3, .message-body h4 { margin: 14px 0 6px; font-size: 1.0em; }
+
+.message-body table { border-collapse: collapse; margin: 10px 0; width: 100%; }
+.message-body th, .message-body td { border: 1px solid var(--border); padding: 7px 12px; font-size: 13px; }
+.message-body th { background: var(--bg-raised); font-weight: 600; }
+.message-body tr:nth-child(even) td { background: rgba(255,255,255,0.015); }
+
+.message-body a { color: var(--accent-bright); text-decoration: underline; text-underline-offset: 2px; }
+.message-body a:hover { color: var(--cyan); }
+
+/* ── Tool blocks ── */
+.tool-block, .tool-result-block {
+  margin: 10px 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.tool-header {
+  padding: 8px 12px;
+  background: var(--bg-raised);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  user-select: none;
+  transition: background 0.1s;
+}
+.tool-header:hover { background: var(--bg-elevated); }
+
+.tool-arrow {
+  font-size: 9px;
+  color: var(--text-muted);
+  transition: transform 0.15s;
+  flex-shrink: 0;
+}
+.tool-arrow.open { transform: rotate(90deg); }
+
+.tool-name {
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  color: var(--accent-bright);
+  font-size: 11.5px;
+}
+
+.tool-summary { color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+
+.tool-body, .tool-result-body {
+  padding: 10px 14px;
+  border-top: 1px solid var(--border-subtle);
+  font-size: 12px;
+  max-height: 360px;
+  overflow: auto;
+}
+.tool-body pre, .tool-result-body pre {
+  margin: 0; white-space: pre-wrap; word-break: break-all; font-size: 12px;
+  background: none; border: none; padding: 0;
+}
+
+.tool-result-header {
+  padding: 7px 12px;
+  background: var(--green-dim);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--green);
+  user-select: none;
+  transition: background 0.1s;
+}
+.tool-result-header:hover { background: rgba(34,197,94,0.15); }
+
+/* ── Stats panel ── */
+.stats-panel { padding: 28px; overflow-y: auto; height: 100%; }
+.stats-panel h2 { font-size: 20px; font-weight: 700; margin-bottom: 22px; letter-spacing: -0.02em; }
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  margin-bottom: 28px;
+}
+
+.stat-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px 20px;
+  transition: border-color 0.15s;
+}
+.stat-card:hover { border-color: rgba(139,92,246,0.3); }
+
+.stat-card-icon { font-size: 18px; margin-bottom: 8px; opacity: 0.7; }
+.stat-value { font-size: 26px; font-weight: 700; letter-spacing: -0.03em; color: var(--accent-bright); }
+.stat-card.cost .stat-value { color: var(--green); }
+.stat-label { font-size: 11px; color: var(--text-muted); margin-top: 3px; font-weight: 500; letter-spacing: 0.02em; text-transform: uppercase; }
+
+.stats-section { margin-bottom: 28px; }
+.stats-section h3 { font-size: 13px; font-weight: 600; margin-bottom: 14px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
+
+.stats-bar-chart { display: flex; flex-direction: column; gap: 8px; }
+
+.bar-row { display: flex; align-items: center; gap: 12px; }
+.bar-label { min-width: 180px; font-size: 12px; color: var(--text-muted); text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bar-track { flex: 1; height: 28px; background: var(--bg-raised); border-radius: var(--radius-sm); overflow: hidden; border: 1px solid var(--border-subtle); }
+.bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent) 0%, #c084fc 100%);
+  border-radius: var(--radius-sm);
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+  font-size: 11px;
+  font-weight: 600;
+  color: white;
+  min-width: fit-content;
+  transition: width 0.4s ease;
+}
+
+/* ── Heatmap ── */
+.heatmap-container { overflow-x: auto; padding-bottom: 4px; }
+.heatmap { display: flex; gap: 3px; }
+.heatmap-week { display: flex; flex-direction: column; gap: 3px; }
+.heatmap-cell {
+  width: 12px; height: 12px; border-radius: 2px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-subtle);
+  cursor: default;
+  transition: transform 0.1s;
+}
+.heatmap-cell:hover { transform: scale(1.3); }
+.heatmap-cell.l1 { background: rgba(139,92,246,0.2); border-color: rgba(139,92,246,0.3); }
+.heatmap-cell.l2 { background: rgba(139,92,246,0.45); border-color: rgba(139,92,246,0.5); }
+.heatmap-cell.l3 { background: rgba(139,92,246,0.7); border-color: rgba(139,92,246,0.75); }
+.heatmap-cell.l4 { background: var(--accent); border-color: var(--accent); }
+.heatmap-months { display: flex; gap: 3px; margin-bottom: 4px; padding-left: 0; }
+.heatmap-month-label { font-size: 10px; color: var(--text-muted); }
+
+/* ── Empty states ── */
 .empty-state {
   display: flex;
   flex-direction: column;
@@ -778,533 +1472,236 @@ body {
   height: 100%;
   color: var(--text-muted);
   font-size: 14px;
-  gap: 8px;
-}
-
-.empty-state .big { font-size: 40px; opacity: 0.3; }
-
-/* ---- Messages ---- */
-.message {
-  margin-bottom: 20px;
-  max-width: 900px;
-}
-
-.message.user {
-  background: var(--user-bg);
-  border: 1px solid rgba(99, 102, 241, 0.2);
-  border-radius: 12px;
-  padding: 14px 18px;
-}
-
-.message.assistant {
-  background: var(--assistant-bg);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 14px 18px;
-}
-
-.message-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 8px;
-  font-size: 12px;
-}
-
-.message-role {
-  font-weight: 600;
-  text-transform: uppercase;
-  font-size: 11px;
-  letter-spacing: 0.5px;
-}
-
-.message.user .message-role { color: #818cf8; }
-.message.assistant .message-role { color: var(--accent); }
-
-.message-time {
-  color: var(--text-muted);
-  font-size: 11px;
-}
-
-.message-body {
-  font-size: 14px;
-  line-height: 1.6;
-}
-
-.message-body p { margin-bottom: 8px; }
-.message-body p:last-child { margin-bottom: 0; }
-
-.message-body pre {
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 12px;
-  overflow-x: auto;
-  margin: 8px 0;
-  font-size: 13px;
-}
-
-.message-body code {
-  background: var(--bg);
-  padding: 2px 5px;
-  border-radius: 3px;
-  font-size: 13px;
-}
-
-.message-body pre code {
-  background: none;
-  padding: 0;
-}
-
-.message-body ul, .message-body ol {
-  margin: 8px 0;
-  padding-left: 24px;
-}
-
-.message-body li { margin-bottom: 4px; }
-
-.message-body blockquote {
-  border-left: 3px solid var(--accent);
-  padding-left: 12px;
-  color: var(--text-muted);
-  margin: 8px 0;
-}
-
-.message-body h1, .message-body h2, .message-body h3, .message-body h4 {
-  margin: 12px 0 6px 0;
-}
-
-.message-body table {
-  border-collapse: collapse;
-  margin: 8px 0;
-  width: 100%;
-}
-
-.message-body th, .message-body td {
-  border: 1px solid var(--border);
-  padding: 6px 10px;
-  font-size: 13px;
-}
-
-.message-body th {
-  background: var(--bg-tertiary);
-}
-
-/* Tool blocks */
-.tool-block {
-  margin: 8px 0;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  overflow: hidden;
-}
-
-.tool-header {
-  padding: 8px 12px;
-  background: var(--bg-tertiary);
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 12px;
-  font-weight: 500;
-  user-select: none;
-}
-
-.tool-header:hover { background: var(--bg); }
-
-.tool-header .arrow {
-  transition: transform 0.15s;
-  font-size: 10px;
-  color: var(--text-muted);
-}
-
-.tool-header .arrow.open { transform: rotate(90deg); }
-
-.tool-name {
-  color: var(--accent);
-  font-family: monospace;
-}
-
-.tool-body {
-  padding: 10px 12px;
-  border-top: 1px solid var(--border);
-  font-size: 12px;
-  max-height: 400px;
-  overflow: auto;
-}
-
-.tool-body pre {
-  margin: 0;
-  white-space: pre-wrap;
-  word-break: break-all;
-  font-size: 12px;
-}
-
-.tool-result-block {
-  margin: 8px 0;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  overflow: hidden;
-}
-
-.tool-result-header {
-  padding: 6px 12px;
-  background: rgba(63, 185, 80, 0.1);
-  border-bottom: 1px solid var(--border);
-  font-size: 11px;
-  color: var(--success);
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  user-select: none;
-}
-
-.tool-result-body {
-  padding: 8px 12px;
-  font-size: 12px;
-  max-height: 300px;
-  overflow: auto;
-}
-
-.tool-result-body pre {
-  margin: 0;
-  white-space: pre-wrap;
-  word-break: break-all;
-  font-size: 12px;
-}
-
-.token-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 2px 8px;
-  background: var(--bg-tertiary);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  font-size: 11px;
-  color: var(--text-muted);
-}
-
-/* ---- Stats panel ---- */
-.stats-panel {
-  padding: 24px;
-  overflow-y: auto;
-  height: 100%;
-}
-
-.stats-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-  gap: 16px;
-  margin-bottom: 24px;
-}
-
-.stat-card {
-  background: var(--bg-secondary);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 16px;
-}
-
-.stat-value {
-  font-size: 28px;
-  font-weight: 700;
-  color: var(--accent);
-}
-
-.stat-label {
-  font-size: 12px;
-  color: var(--text-muted);
-  margin-top: 4px;
-}
-
-.stats-section {
-  margin-bottom: 24px;
-}
-
-.stats-section h3 {
-  font-size: 14px;
-  font-weight: 600;
-  margin-bottom: 12px;
-  color: var(--text);
-}
-
-.stats-bar-chart {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.bar-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
-.bar-label {
-  min-width: 200px;
-  font-size: 12px;
-  color: var(--text-muted);
-  text-align: right;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.bar-track {
-  flex: 1;
-  height: 24px;
-  background: var(--bg);
-  border-radius: 4px;
-  overflow: hidden;
-}
-
-.bar-fill {
-  height: 100%;
-  background: linear-gradient(90deg, var(--accent), #a855f7);
-  border-radius: 4px;
-  display: flex;
-  align-items: center;
-  padding-left: 8px;
-  font-size: 11px;
-  font-weight: 500;
-  min-width: fit-content;
-}
-
-/* ---- Loading ---- */
-.loading {
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  gap: 10px;
+  text-align: center;
   padding: 40px;
-  color: var(--text-muted);
 }
+.empty-icon { font-size: 48px; opacity: 0.15; margin-bottom: 4px; }
+.empty-title { font-size: 16px; font-weight: 600; color: var(--text); opacity: 0.5; }
+.empty-hint { font-size: 12px; color: var(--text-faint); }
 
-.spinner {
-  width: 20px;
-  height: 20px;
-  border: 2px solid var(--border);
-  border-top-color: var(--accent);
-  border-radius: 50%;
-  animation: spin 0.6s linear infinite;
-  margin-right: 10px;
+.first-run { gap: 12px; }
+.first-run .empty-icon { opacity: 0.12; }
+.setup-steps { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; max-width: 300px; }
+.setup-step {
+  display: flex; align-items: flex-start; gap: 10px;
+  background: var(--bg-raised); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 10px 12px; text-align: left;
+  font-size: 12px;
 }
+.step-num {
+  width: 20px; height: 20px; border-radius: 50%;
+  background: var(--accent-dim); color: var(--accent-bright);
+  font-size: 10px; font-weight: 700;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.setup-step code { font-size: 11px; color: var(--accent-bright); background: var(--bg); padding: 1px 4px; border-radius: 3px; }
 
+/* ── Loading ── */
+.loading { display: flex; align-items: center; justify-content: center; padding: 40px; color: var(--text-muted); gap: 10px; }
+.spinner { width: 18px; height: 18px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.55s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* ---- Scrollbar ---- */
-::-webkit-scrollbar { width: 8px; height: 8px; }
+/* ── Update banner ── */
+.update-banner {
+  background: linear-gradient(90deg, rgba(139,92,246,0.12) 0%, rgba(192,132,252,0.08) 100%);
+  border-bottom: 1px solid rgba(139,92,246,0.25);
+  color: var(--text);
+  padding: 8px 16px;
+  font-size: 12.5px;
+  display: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.update-banner.show { display: flex; }
+.update-banner code { background: var(--bg-elevated); padding: 1px 7px; border-radius: 4px; font-size: 11.5px; color: var(--accent-bright); }
+.update-banner .dismiss-btn { background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 16px; padding: 0 4px; line-height: 1; flex-shrink: 0; }
+.update-banner .dismiss-btn:hover { color: var(--text); }
+
+/* ── Shortcuts hint ── */
+.shortcuts-hint {
+  padding: 6px 14px;
+  border-top: 1px solid var(--border-subtle);
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+}
+.shortcut { font-size: 10px; color: var(--text-faint); }
+.shortcut kbd {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 1px 4px;
+  font-size: 10px;
+  font-family: inherit;
+  color: var(--text-muted);
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 7px; height: 7px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
-::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+::-webkit-scrollbar-thumb:hover { background: var(--text-faint); }
 
-/* ---- Back button (mobile) ---- */
-.back-btn {
-  display: none;
-  padding: 6px 10px;
-  border: 1px solid var(--border);
-  background: var(--bg-tertiary);
-  color: var(--text);
-  border-radius: 6px;
-  cursor: pointer;
-  font-size: 13px;
-  margin-right: 10px;
-  flex-shrink: 0;
-  transition: all 0.15s;
-}
-
-.back-btn:hover {
-  background: var(--accent-dim);
-  border-color: var(--accent);
-  color: var(--accent);
-}
-
-/* ---- Responsive: tablets ---- */
+/* ── Responsive ── */
 @media (max-width: 1024px) {
   .sidebar { width: 300px; min-width: 300px; }
   .message { max-width: 100%; }
-  .stats-grid { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
-  .bar-label { min-width: 140px; }
 }
 
-/* ---- Responsive: mobile ---- */
 @media (max-width: 768px) {
   .sidebar { width: 100%; min-width: 100%; }
   .main { display: none; }
   .app.conv-open .sidebar { display: none; }
   .app.conv-open .main { display: flex; }
-  .back-btn { display: block; }
-
-  .main-header-top {
-    padding: 8px 12px;
-  }
-
-  .main-header-title {
-    font-size: 13px;
-  }
-
-  .main-header-session {
-    padding: 6px 12px;
-    gap: 6px;
-  }
-
-  .session-id {
-    font-size: 11px;
-    max-width: 200px;
-  }
-
-  .main-header-actions { gap: 4px; }
-  .btn { padding: 5px 10px; font-size: 11px; }
-
-  .messages-container { padding: 12px; }
-  .message { padding: 10px 14px; }
-  .message-body { font-size: 13px; }
-  .message-header { flex-wrap: wrap; gap: 4px; }
-
+  .back-btn { display: flex; }
+  .messages-container { padding: 14px; }
+  .message { padding: 12px 14px; }
   .stats-panel { padding: 16px; }
   .stats-grid { grid-template-columns: repeat(2, 1fr); gap: 10px; }
-  .stat-card { padding: 12px; }
   .stat-value { font-size: 22px; }
-  .bar-label { min-width: 100px; font-size: 11px; }
-  .bar-fill { font-size: 10px; }
-
-  .sidebar-header h1 { font-size: 14px; }
-  .filter-row { flex-direction: column; gap: 6px; }
-  #projectFilter, #sortSelect { flex: unset; width: 100%; }
+  .bar-label { min-width: 100px; }
+  .filter-row { flex-direction: column; }
 }
 
-/* ---- Responsive: very small ---- */
 @media (max-width: 480px) {
-  .sidebar-header { padding: 12px; }
+  .sidebar-header { padding: 10px; }
   .conv-list { padding: 4px; }
-  .conv-item { padding: 8px 10px; }
+  .conv-item { padding: 9px 10px; }
   .stats-grid { grid-template-columns: 1fr 1fr; gap: 8px; }
-  .stat-value { font-size: 18px; }
-  .bar-row { flex-direction: column; align-items: stretch; gap: 2px; }
-  .bar-label { min-width: unset; text-align: left; font-size: 11px; }
-}
-
-/* ---- Update banner ---- */
-.update-banner {
-  background: var(--accent-dim);
-  border-bottom: 1px solid var(--accent);
-  color: var(--text);
-  padding: 8px 16px;
-  font-size: 13px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  z-index: 100;
-}
-.update-banner code {
-  background: var(--bg-tertiary);
-  padding: 2px 8px;
-  border-radius: 4px;
-  font-size: 12px;
-  color: var(--accent);
-}
-.update-banner .dismiss-btn {
-  background: none;
-  border: none;
-  color: var(--text-muted);
-  cursor: pointer;
-  font-size: 16px;
-  padding: 0 4px;
-  line-height: 1;
-}
-.update-banner .dismiss-btn:hover {
-  color: var(--text);
 }
 </style>
 </head>
 <body>
-<div class="update-banner" id="updateBanner" style="display:none">
-  <span>&#10022; Update available! Run <code>pip install --upgrade claude-conversation-viewer</code> to update.</span>
+
+<div class="update-banner" id="updateBanner">
+  <span>&#10022; Update available! Run <code>pip install --upgrade claude-conversation-viewer</code></span>
   <button class="dismiss-btn" onclick="dismissUpdate()" title="Dismiss">&times;</button>
 </div>
+
 <div class="app" id="app">
   <!-- Sidebar -->
   <div class="sidebar">
     <div class="sidebar-header">
-      <h1><span class="logo">&#9670;</span> Claude Code Conversations</h1>
+      <div class="brand">
+        <div class="brand-icon">&#9670;</div>
+        <div>
+          <div class="brand-text">Claude Conversations</div>
+        </div>
+        <div class="brand-actions">
+          <button class="icon-btn" id="refreshBtn" onclick="triggerRefresh()" title="Refresh conversations">&#8635;</button>
+          <div class="icon-btn" style="position:relative; cursor:default;" title="Export all">
+            <span style="font-size:11px;cursor:pointer;" onclick="showExportMenu(this)">&#8615;</span>
+            <div id="exportMenu" style="display:none;position:absolute;top:30px;right:0;background:var(--bg-raised);border:1px solid var(--border);border-radius:var(--radius-sm);min-width:160px;z-index:100;overflow:hidden;">
+              <div style="padding:7px 12px;font-size:12px;cursor:pointer;transition:background 0.1s;" onmouseover="this.style.background='var(--bg-elevated)'" onmouseout="this.style.background=''" onclick="exportAll('md')">Export all as .md (zip)</div>
+              <div style="padding:7px 12px;font-size:12px;cursor:pointer;transition:background 0.1s;border-top:1px solid var(--border-subtle);" onmouseover="this.style.background='var(--bg-elevated)'" onmouseout="this.style.background=''" onclick="exportAll('json')">Export all as .json (zip)</div>
+            </div>
+          </div>
+        </div>
+      </div>
       <div class="tabs">
         <button class="tab-btn active" data-tab="conversations" onclick="switchTab('conversations')">Conversations</button>
+        <button class="tab-btn" data-tab="bookmarked" onclick="switchTab('bookmarked')">&#9733; Saved</button>
         <button class="tab-btn" data-tab="stats" onclick="switchTab('stats')">Stats</button>
       </div>
-      <input type="text" class="search-box" id="searchBox" placeholder="Search conversations..." oninput="filterConversations()">
+      <div class="search-wrap" id="searchWrap">
+        <span class="search-icon">&#9906;</span>
+        <input type="text" class="search-box" id="searchBox" placeholder="Search conversations…" oninput="onSearchInput()" onkeydown="onSearchKey(event)">
+        <button class="search-mode-toggle" id="searchModeBtn" onclick="toggleContentSearch()" title="Toggle content search">DEEP</button>
+      </div>
       <div class="filter-row">
         <select class="filter-select" id="projectFilter" onchange="filterConversations()">
           <option value="">All projects</option>
         </select>
         <select class="filter-select" id="sortSelect" onchange="filterConversations()">
-          <option value="newest">Newest first</option>
-          <option value="oldest">Oldest first</option>
-          <option value="most-messages">Most messages</option>
+          <option value="newest">Newest</option>
+          <option value="oldest">Oldest</option>
+          <option value="most-messages">Most msgs</option>
           <option value="most-tokens">Most tokens</option>
+          <option value="highest-cost">Highest cost</option>
         </select>
       </div>
     </div>
+    <div class="refresh-banner" id="refreshBanner">
+      <span id="refreshBannerText">New conversations available</span>
+      <button onclick="applyRefresh()">Refresh</button>
+    </div>
     <div class="conv-list" id="convList">
-      <div class="loading"><div class="spinner"></div> Loading conversations...</div>
+      <div class="loading"><div class="spinner"></div> Loading…</div>
+    </div>
+    <div class="shortcuts-hint">
+      <span class="shortcut"><kbd>/</kbd> search</span>
+      <span class="shortcut"><kbd>j</kbd><kbd>k</kbd> navigate</span>
+      <span class="shortcut"><kbd>b</kbd> bookmark</span>
+      <span class="shortcut"><kbd>↵</kbd> open</span>
     </div>
   </div>
 
-  <!-- Main -->
+  <!-- Main panel -->
   <div class="main" id="mainPanel">
     <div class="main-header" id="mainHeader">
       <div class="main-header-top">
-        <button class="back-btn" onclick="goBack()">&larr; Back</button>
+        <button class="back-btn" onclick="goBack()">&#8592; Back</button>
         <span class="main-header-title" id="mainTitle">Select a conversation</span>
         <div class="main-header-actions" id="mainActions" style="display:none">
-          <button class="btn" onclick="exportConversation('md')">Export .md</button>
-          <button class="btn" onclick="exportConversation('json')">Export .json</button>
+          <button class="btn btn-icon" id="bookmarkHeaderBtn" onclick="toggleBookmarkCurrent()" title="Bookmark">&#9733;</button>
+          <button class="btn btn-sm" onclick="exportConversation('md')">&#8615; .md</button>
+          <button class="btn btn-sm" onclick="exportConversation('json')">&#8615; .json</button>
         </div>
       </div>
       <div class="main-header-session" id="sessionBar" style="display:none">
-        <span class="session-label">Session ID:</span>
+        <span class="session-label">Session ID</span>
         <code class="session-id" id="sessionIdText"></code>
-        <button class="btn btn-sm" onclick="copyResume()" id="copyBtn">Copy resume command</button>
+        <button class="btn btn-sm" onclick="copyResume()" id="copyBtn">Copy resume cmd</button>
       </div>
     </div>
+
     <div class="messages-container" id="messagesContainer">
       <div class="empty-state">
-        <div class="big">&#9670;</div>
-        <div>Select a conversation from the sidebar</div>
+        <div class="empty-icon">&#9670;</div>
+        <div class="empty-title">No conversation selected</div>
+        <div class="empty-hint">Use <kbd style="background:var(--bg-elevated);border:1px solid var(--border);border-radius:3px;padding:1px 5px;font-size:11px;">/</kbd> to search or click any conversation</div>
       </div>
     </div>
-    <!-- Stats (hidden by default) -->
+
     <div class="stats-panel" id="statsPanel" style="display:none">
-      <div class="loading"><div class="spinner"></div> Loading stats...</div>
+      <div class="loading"><div class="spinner"></div> Loading stats…</div>
     </div>
   </div>
 </div>
 
 <script>
-// ---- State ----
+// ── State ──
 let allConversations = [];
 let allProjects = [];
 let currentConvId = null;
 let currentTab = 'conversations';
+let contentSearchMode = false;
+let searchDebounce = null;
+let refreshData = null;
+let filteredList = [];
+let selectedIdx = -1;
 
-// ---- Init ----
+// ── Init ──
 document.addEventListener('DOMContentLoaded', init);
+document.addEventListener('keydown', handleGlobalKey);
+document.addEventListener('click', handleGlobalClick);
 
 async function init() {
   const res = await fetch('/api/conversations');
   const data = await res.json();
-  allConversations = data.conversations;
-  allProjects = data.projects;
+  allConversations = data.conversations || [];
+  allProjects = data.projects || [];
 
-  // Build project display name map from conversation cwd values
   const projectDisplayNames = {};
   allConversations.forEach(c => {
-    if (!projectDisplayNames[c.project]) {
-      projectDisplayNames[c.project] = c.project_path || decodeProject(c.project);
-    }
+    if (!projectDisplayNames[c.project])
+      projectDisplayNames[c.project] = c.project_path || c.project;
   });
 
-  // Populate project filter
   const sel = document.getElementById('projectFilter');
   allProjects.forEach(p => {
     const opt = document.createElement('option');
@@ -1315,38 +1712,66 @@ async function init() {
 
   renderConversationList(allConversations);
 
-  // Check for updates
-  if (!sessionStorage.getItem('update-dismissed')) {
+  if (!sessionStorage.getItem('update-dismissed'))
     checkForUpdate();
+
+  // Auto-refresh: poll every 45 seconds
+  setInterval(pollForNewConversations, 45000);
+
+  // Init marked options
+  if (typeof marked !== 'undefined') {
+    marked.setOptions({ breaks: true, gfm: true });
   }
 }
 
-// ---- Update Check ----
+// ── Update check ──
 async function checkForUpdate() {
   try {
-    const res = await fetch('/api/update-check');
-    const data = await res.json();
-    if (data.update_available) {
-      document.getElementById('updateBanner').style.display = 'flex';
-    }
-  } catch (e) {
-    // silently ignore
-  }
+    const r = await fetch('/api/update-check');
+    const d = await r.json();
+    if (d.update_available) document.getElementById('updateBanner').classList.add('show');
+  } catch {}
 }
-
 function dismissUpdate() {
-  document.getElementById('updateBanner').style.display = 'none';
+  document.getElementById('updateBanner').classList.remove('show');
   sessionStorage.setItem('update-dismissed', '1');
 }
 
-function decodeProject(slug) {
-  return slug.replace(/-/g, '/');
+// ── Auto-refresh polling ──
+async function pollForNewConversations() {
+  try {
+    const r = await fetch('/api/status');
+    const d = await r.json();
+    if (d.count > allConversations.length) {
+      const diff = d.count - allConversations.length;
+      const banner = document.getElementById('refreshBanner');
+      document.getElementById('refreshBannerText').textContent =
+        `${diff} new conversation${diff > 1 ? 's' : ''} available`;
+      banner.classList.add('show');
+    }
+  } catch {}
 }
 
-function shortenPath(fullPath) {
-  if (!fullPath) return '';
-  // Show just the last 2 meaningful segments: e.g. "engineering/myproject" or "~/myproject"
-  const parts = fullPath.replace(/\\/g, '/').split('/').filter(Boolean);
+async function triggerRefresh() {
+  const btn = document.getElementById('refreshBtn');
+  btn.style.opacity = '0.5';
+  try {
+    const r = await fetch('/api/refresh');
+    const d = await r.json();
+    allConversations = d.conversations || [];
+    allProjects = d.projects || [];
+    document.getElementById('refreshBanner').classList.remove('show');
+    filterConversations();
+  } catch {}
+  btn.style.opacity = '1';
+}
+
+function applyRefresh() { triggerRefresh(); }
+
+// ── Helpers ──
+function shortenPath(p) {
+  if (!p) return '';
+  const parts = p.replace(/\\/g, '/').split('/').filter(Boolean);
   const home = parts.indexOf('Users') >= 0 ? parts.slice(parts.indexOf('Users') + 2) : parts;
   if (home.length === 0) return '~';
   if (home.length <= 2) return '~/' + home.join('/');
@@ -1357,114 +1782,329 @@ function formatDate(ts) {
   if (!ts) return '';
   const d = new Date(ts);
   const now = new Date();
-  const diffMs = now - d;
-  const diffDays = Math.floor(diffMs / 86400000);
-  if (diffDays === 0) return 'Today ' + d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+  const diffDays = Math.floor((now - d) / 86400000);
+  if (diffDays === 0) return 'Today ' + d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
   if (diffDays === 1) return 'Yesterday';
-  if (diffDays < 7) return d.toLocaleDateString([], {weekday: 'short'});
-  return d.toLocaleDateString([], {month: 'short', day: 'numeric', year: 'numeric'});
+  if (diffDays < 7) return d.toLocaleDateString([], {weekday:'short'});
+  return d.toLocaleDateString([], {month:'short', day:'numeric'});
 }
 
 function formatTokens(n) {
-  if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
-  if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+  if (n >= 1e6) return (n/1e6).toFixed(1)+'M';
+  if (n >= 1e3) return (n/1e3).toFixed(0)+'K';
   return n.toString();
 }
 
-// ---- Tabs ----
+function formatCost(usd) {
+  if (!usd || usd === 0) return '';
+  if (usd < 0.005) return '<$0.01';
+  if (usd < 1) return '$' + usd.toFixed(2);
+  return '$' + usd.toFixed(2);
+}
+
+function cleanModelName(m) {
+  if (!m) return '';
+  // Strip trailing date like -20251001
+  return m.replace(/-\d{8}$/, '');
+}
+
+function escapeHtml(s) {
+  if (!s) return '';
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── Tabs ──
 function switchTab(tab) {
   currentTab = tab;
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
 
-  const mainHeader = document.getElementById('mainHeader');
-  const msgContainer = document.getElementById('messagesContainer');
-  const statsPanel = document.getElementById('statsPanel');
+  const header = document.getElementById('mainHeader');
+  const msgs = document.getElementById('messagesContainer');
+  const stats = document.getElementById('statsPanel');
+  const searchWrap = document.getElementById('searchWrap');
+  const filterRow = document.querySelector('.filter-row');
 
-  if (tab === 'conversations') {
-    mainHeader.style.display = 'block';
-    msgContainer.style.display = 'block';
-    statsPanel.style.display = 'none';
-    // Hide session bar if no conversation is selected
-    if (!currentConvId) {
-      document.getElementById('sessionBar').style.display = 'none';
-    }
-  } else {
-    mainHeader.style.display = 'none';
-    msgContainer.style.display = 'none';
-    statsPanel.style.display = 'block';
+  if (tab === 'stats') {
+    header.style.display = 'none';
+    msgs.style.display = 'none';
+    stats.style.display = 'block';
     loadStats();
+  } else {
+    header.style.display = 'block';
+    msgs.style.display = 'block';
+    stats.style.display = 'none';
+    if (!currentConvId) document.getElementById('sessionBar').style.display = 'none';
+  }
+
+  if (tab === 'bookmarked') {
+    loadBookmarked();
+  } else if (tab === 'conversations') {
+    filterConversations();
   }
 }
 
-// ---- Filter & Search ----
+// ── Search ──
+function onSearchInput() {
+  if (currentTab === 'stats') return;
+  clearTimeout(searchDebounce);
+  if (contentSearchMode) {
+    searchDebounce = setTimeout(runContentSearch, 400);
+  } else {
+    filterConversations();
+  }
+}
+
+function onSearchKey(e) {
+  if (e.key === 'Escape') { document.getElementById('searchBox').value = ''; filterConversations(); }
+  if (e.key === 'ArrowDown') { e.preventDefault(); moveSel(1); }
+  if (e.key === 'ArrowUp') { e.preventDefault(); moveSel(-1); }
+  if (e.key === 'Enter') { e.preventDefault(); openSelected(); }
+}
+
+function toggleContentSearch() {
+  contentSearchMode = !contentSearchMode;
+  const btn = document.getElementById('searchModeBtn');
+  btn.classList.toggle('active', contentSearchMode);
+  btn.title = contentSearchMode ? 'Content search active — click to disable' : 'Click for deep content search';
+  if (!contentSearchMode) filterConversations();
+  else if (document.getElementById('searchBox').value.length >= 2) runContentSearch();
+}
+
+async function runContentSearch() {
+  const q = document.getElementById('searchBox').value.trim();
+  if (q.length < 2) { filterConversations(); return; }
+  const container = document.getElementById('convList');
+  container.innerHTML = '<div class="loading"><div class="spinner"></div> Searching content…</div>';
+  try {
+    const r = await fetch('/api/search?q=' + encodeURIComponent(q));
+    const d = await r.json();
+    renderSearchResults(d.results || [], q);
+  } catch {
+    filterConversations();
+  }
+}
+
+function renderSearchResults(results, query) {
+  const container = document.getElementById('convList');
+  if (results.length === 0) {
+    container.innerHTML = '<div class="empty-state"><div class="empty-icon" style="font-size:32px">&#128269;</div><div class="empty-title">No matches found</div><div class="empty-hint">Try different keywords</div></div>';
+    return;
+  }
+  container.innerHTML = results.map((r, i) => `
+    <div class="conv-item ${r.id === currentConvId ? 'active' : ''}" data-id="${escapeHtml(r.id)}" data-idx="${i}" onclick="loadConversation('${escapeHtml(r.id)}')">
+      <div class="conv-item-top">
+        <span class="conv-project">${escapeHtml(shortenPath(r.project_path) || r.project_path)}</span>
+        <button class="bookmark-btn ${r.bookmarked ? 'bookmarked' : ''}" onclick="event.stopPropagation();toggleBookmark('${escapeHtml(r.id)}',this)" title="Bookmark">&#9733;</button>
+      </div>
+      <div class="conv-title">${escapeHtml(r.title)}</div>
+      ${r.snippet ? `<div class="search-snippet">${escapeHtml(r.snippet)}</div>` : ''}
+      <div class="conv-meta">
+        <span>${formatDate(r.first_timestamp)}</span>
+      </div>
+    </div>
+  `).join('');
+  filteredList = results.map(r => r.id);
+}
+
+// ── Filter ──
 function filterConversations() {
+  if (currentTab === 'bookmarked') return;
   const query = document.getElementById('searchBox').value.toLowerCase();
   const project = document.getElementById('projectFilter').value;
   const sort = document.getElementById('sortSelect').value;
 
-  let filtered = allConversations;
-
-  if (project) {
-    filtered = filtered.filter(c => c.project === project);
-  }
-
+  let list = allConversations;
+  if (project) list = list.filter(c => c.project === project);
   if (query) {
-    filtered = filtered.filter(c =>
+    list = list.filter(c =>
       (c.title || '').toLowerCase().includes(query) ||
+      (c.preview || '').toLowerCase().includes(query) ||
       (c.project_path || '').toLowerCase().includes(query) ||
       (c.models || []).some(m => m.toLowerCase().includes(query))
     );
   }
 
-  // Sort
-  if (sort === 'newest') {
-    filtered.sort((a, b) => (b.last_timestamp || '').localeCompare(a.last_timestamp || ''));
-  } else if (sort === 'oldest') {
-    filtered.sort((a, b) => (a.first_timestamp || '').localeCompare(b.first_timestamp || ''));
-  } else if (sort === 'most-messages') {
-    filtered.sort((a, b) => b.total_messages - a.total_messages);
-  } else if (sort === 'most-tokens') {
-    filtered.sort((a, b) => (b.total_input_tokens + b.total_output_tokens) - (a.total_input_tokens + a.total_output_tokens));
-  }
+  if (sort === 'newest')       list = [...list].sort((a,b) => (b.last_timestamp||'').localeCompare(a.last_timestamp||''));
+  else if (sort === 'oldest')  list = [...list].sort((a,b) => (a.first_timestamp||'').localeCompare(b.first_timestamp||''));
+  else if (sort === 'most-messages') list = [...list].sort((a,b) => b.total_messages - a.total_messages);
+  else if (sort === 'most-tokens')   list = [...list].sort((a,b) => (b.total_input_tokens+b.total_output_tokens)-(a.total_input_tokens+a.total_output_tokens));
+  else if (sort === 'highest-cost')  list = [...list].sort((a,b) => (b.estimated_cost_usd||0)-(a.estimated_cost_usd||0));
 
-  renderConversationList(filtered);
+  filteredList = list.map(c => c.id);
+  renderConversationList(list);
 }
 
-// ---- Render conversation list ----
+// ── Bookmarks ──
+async function loadBookmarked() {
+  const container = document.getElementById('convList');
+  container.innerHTML = '<div class="loading"><div class="spinner"></div> Loading…</div>';
+  try {
+    const r = await fetch('/api/bookmarks');
+    const d = await r.json();
+    const bookmarks = d.bookmarks || [];
+    filteredList = bookmarks.map(c => c.id);
+    if (bookmarks.length === 0) {
+      container.innerHTML = '<div class="empty-state"><div class="empty-icon" style="font-size:36px">&#9733;</div><div class="empty-title">No saved conversations</div><div class="empty-hint">Click &#9733; on any conversation to save it</div></div>';
+    } else {
+      renderConversationList(bookmarks);
+    }
+  } catch {
+    container.innerHTML = '<div class="empty-state"><div>Error loading bookmarks</div></div>';
+  }
+}
+
+async function toggleBookmark(id, btn) {
+  const isBookmarked = btn.classList.contains('bookmarked');
+  const newState = !isBookmarked;
+  try {
+    await fetch('/api/bookmarks', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({id, bookmarked: newState}),
+    });
+    btn.classList.toggle('bookmarked', newState);
+    // Update allConversations
+    const conv = allConversations.find(c => c.id === id);
+    if (conv) conv.bookmarked = newState;
+    // Update header btn
+    if (id === currentConvId) {
+      updateBookmarkHeaderBtn(newState);
+    }
+    if (currentTab === 'bookmarked') loadBookmarked();
+  } catch {}
+}
+
+function updateBookmarkHeaderBtn(bookmarked) {
+  const btn = document.getElementById('bookmarkHeaderBtn');
+  btn.classList.toggle('bookmarked-active', bookmarked);
+  btn.title = bookmarked ? 'Remove bookmark' : 'Bookmark this conversation';
+}
+
+async function toggleBookmarkCurrent() {
+  if (!currentConvId) return;
+  const conv = allConversations.find(c => c.id === currentConvId);
+  const isBookmarked = conv ? conv.bookmarked : false;
+  const newState = !isBookmarked;
+  try {
+    await fetch('/api/bookmarks', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({id: currentConvId, bookmarked: newState}),
+    });
+    if (conv) conv.bookmarked = newState;
+    updateBookmarkHeaderBtn(newState);
+    // Update sidebar btn
+    const sideBtn = document.querySelector(`.conv-item[data-id="${currentConvId}"] .bookmark-btn`);
+    if (sideBtn) sideBtn.classList.toggle('bookmarked', newState);
+  } catch {}
+}
+
+// ── Render list ──
 function renderConversationList(convs) {
   const container = document.getElementById('convList');
   if (convs.length === 0) {
-    container.innerHTML = '<div class="empty-state"><div>No conversations found</div></div>';
+    const hasAny = allConversations.length > 0;
+    if (!hasAny) {
+      container.innerHTML = `
+        <div class="empty-state first-run">
+          <div class="empty-icon">&#9670;</div>
+          <div class="empty-title">No conversations yet</div>
+          <div class="setup-steps">
+            <div class="setup-step"><div class="step-num">1</div><div>Install Claude Code: <code>npm i -g @anthropic-ai/claude-code</code></div></div>
+            <div class="setup-step"><div class="step-num">2</div><div>Start a session: <code>claude</code> in any directory</div></div>
+            <div class="setup-step"><div class="step-num">3</div><div>Reload this page to browse your history</div></div>
+          </div>
+        </div>`;
+    } else {
+      container.innerHTML = '<div class="empty-state"><div class="empty-icon" style="font-size:32px">&#128269;</div><div class="empty-title">No matches</div><div class="empty-hint">Try a different search or filter</div></div>';
+    }
     return;
   }
 
-  container.innerHTML = convs.map(c => `
-    <div class="conv-item ${c.id === currentConvId ? 'active' : ''}" onclick="loadConversation('${c.id}')">
-      <div class="conv-project" title="${escapeHtml(c.project_path || '')}">${escapeHtml(shortenPath(c.project_path) || c.project)}</div>
+  filteredList = convs.map(c => c.id);
+
+  container.innerHTML = convs.map((c, i) => {
+    const cost = formatCost(c.estimated_cost_usd);
+    const model = c.models && c.models.length ? cleanModelName(c.models[0]) : '';
+    const previewText = c.preview && c.preview !== c.title ? c.preview.slice(c.title ? c.title.length : 0, 180).trim() : '';
+    const totalTok = c.total_input_tokens + c.total_output_tokens;
+    return `
+    <div class="conv-item ${c.id === currentConvId ? 'active' : ''}" data-id="${escapeHtml(c.id)}" data-idx="${i}" onclick="loadConversation('${escapeHtml(c.id)}')">
+      <div class="conv-item-top">
+        <span class="conv-project" title="${escapeHtml(c.project_path || '')}">${escapeHtml(shortenPath(c.project_path) || c.project)}</span>
+        <button class="bookmark-btn ${c.bookmarked ? 'bookmarked' : ''}" onclick="event.stopPropagation();toggleBookmark('${escapeHtml(c.id)}',this)" title="${c.bookmarked ? 'Remove bookmark' : 'Bookmark'}">&#9733;</button>
+      </div>
       <div class="conv-title">${escapeHtml(c.title)}</div>
-      <div class="conv-id">${c.id}</div>
+      ${previewText ? `<div class="conv-preview">${escapeHtml(previewText)}</div>` : ''}
       <div class="conv-meta">
         <span>${formatDate(c.first_timestamp)}</span>
+        <span class="meta-sep">·</span>
         <span>${c.total_messages} msgs</span>
-        ${c.models.length ? `<span class="badge">${escapeHtml(c.models[0])}</span>` : ''}
-        <span>${formatTokens(c.total_input_tokens + c.total_output_tokens)} tok</span>
+        ${cost ? `<span class="cost-badge">${escapeHtml(cost)}</span>` : ''}
+        ${model ? `<span class="model-badge" title="${escapeHtml(c.models[0])}">${escapeHtml(model)}</span>` : ''}
       </div>
-    </div>
-  `).join('');
+    </div>`;
+  }).join('');
+
+  selectedIdx = -1;
 }
 
-// ---- Load conversation ----
+// ── Keyboard navigation ──
+function moveSel(dir) {
+  if (filteredList.length === 0) return;
+  selectedIdx = Math.max(0, Math.min(filteredList.length - 1, selectedIdx + dir));
+  document.querySelectorAll('.conv-item').forEach((el, i) => {
+    el.classList.toggle('active', i === selectedIdx && el.dataset.id !== currentConvId);
+    if (i === selectedIdx) el.scrollIntoView({block:'nearest'});
+  });
+}
+
+function openSelected() {
+  if (selectedIdx >= 0 && filteredList[selectedIdx]) {
+    loadConversation(filteredList[selectedIdx]);
+  }
+}
+
+function handleGlobalKey(e) {
+  const tag = document.activeElement.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+
+  if (e.key === '/' || (e.key === 'k' && (e.metaKey || e.ctrlKey))) {
+    e.preventDefault();
+    document.getElementById('searchBox').focus();
+    return;
+  }
+  if (e.key === 'j' || e.key === 'ArrowDown') { e.preventDefault(); moveSel(1); }
+  if (e.key === 'k' || e.key === 'ArrowUp')   { e.preventDefault(); moveSel(-1); }
+  if (e.key === 'Enter') openSelected();
+  if (e.key === 'Escape') goBack();
+  if (e.key === 'b' && currentConvId) toggleBookmarkCurrent();
+}
+
+function handleGlobalClick(e) {
+  const menu = document.getElementById('exportMenu');
+  if (menu && menu.style.display !== 'none' && !menu.contains(e.target) && !e.target.closest('.icon-btn')) {
+    menu.style.display = 'none';
+  }
+}
+
+function showExportMenu(el) {
+  const menu = document.getElementById('exportMenu');
+  menu.style.display = menu.style.display === 'none' ? 'block' : 'none';
+}
+
+// ── Load conversation ──
 async function loadConversation(id) {
   currentConvId = id;
   document.getElementById('app').classList.add('conv-open');
+  selectedIdx = -1;
 
-  // Update active state
   document.querySelectorAll('.conv-item').forEach(el => {
-    el.classList.toggle('active', el.onclick.toString().includes(id));
+    el.classList.toggle('active', el.dataset.id === id);
   });
 
   const container = document.getElementById('messagesContainer');
-  container.innerHTML = '<div class="loading"><div class="spinner"></div> Loading conversation...</div>';
+  container.innerHTML = '<div class="loading"><div class="spinner"></div> Loading…</div>';
   document.getElementById('mainActions').style.display = 'flex';
 
   const res = await fetch(`/api/conversation/${id}`);
@@ -1475,318 +2115,351 @@ async function loadConversation(id) {
   document.getElementById('mainTitle').textContent = meta.title;
   document.getElementById('sessionBar').style.display = 'flex';
   document.getElementById('sessionIdText').textContent = meta.id;
+  updateBookmarkHeaderBtn(meta.bookmarked);
 
   if (msgs.length === 0) {
-    container.innerHTML = '<div class="empty-state"><div>No messages in this conversation</div></div>';
+    container.innerHTML = '<div class="empty-state"><div class="empty-icon">&#9670;</div><div class="empty-title">No messages</div></div>';
     return;
   }
 
   container.innerHTML = msgs.map(renderMessage).join('');
 
-  // Highlight code blocks
   if (typeof hljs !== 'undefined') {
     container.querySelectorAll('pre code').forEach(el => {
-      try { hljs.highlightElement(el); } catch(e) {}
+      try { hljs.highlightElement(el); } catch {}
     });
   }
 
+  addCopyButtons(container);
   container.scrollTop = 0;
 }
 
+// ── Render message ──
 function renderMessage(msg) {
   const role = msg.role;
-  const time = msg.timestamp ? new Date(msg.timestamp).toLocaleString() : '';
+  const time = msg.timestamp ? new Date(msg.timestamp).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '';
   const content = msg.content || [];
 
-  let usageBadge = '';
-  if (role === 'assistant' && msg.usage) {
-    const u = msg.usage;
-    const total = u.input_tokens + u.output_tokens;
-    if (total > 0) {
-      usageBadge = `<span class="token-badge">in: ${formatTokens(u.input_tokens)} / out: ${formatTokens(u.output_tokens)}</span>`;
+  let tokBadge = '';
+  let costBadge = '';
+  let modelLabel = '';
+
+  if (role === 'assistant') {
+    if (msg.usage) {
+      const u = msg.usage;
+      const total = u.input_tokens + u.output_tokens;
+      if (total > 0) {
+        tokBadge = `<span class="token-badge">&#8595;${formatTokens(u.input_tokens)} &#8593;${formatTokens(u.output_tokens)}</span>`;
+      }
+      if (u.cache_read > 0) {
+        tokBadge += ` <span class="token-badge" style="color:var(--cyan)">&#9400; ${formatTokens(u.cache_read)}</span>`;
+      }
+    }
+    if (msg.estimated_cost_usd > 0.0001) {
+      costBadge = `<span class="msg-cost-badge">${formatCost(msg.estimated_cost_usd)}</span>`;
+    }
+    if (msg.model) {
+      modelLabel = `<span class="message-model">${escapeHtml(cleanModelName(msg.model))}</span>`;
     }
   }
 
-  const modelBadge = msg.model ? `<span class="badge">${escapeHtml(msg.model)}</span>` : '';
-
-  let bodyHtml = content.map(block => {
-    if (block.type === 'text') {
-      return renderMarkdown(block.text);
-    } else if (block.type === 'tool_use') {
-      return renderToolUse(block);
-    } else if (block.type === 'tool_result') {
-      return renderToolResult(block);
-    }
+  const bodyHtml = content.map(block => {
+    if (block.type === 'text') return renderMarkdown(block.text);
+    if (block.type === 'tool_use') return renderToolUse(block);
+    if (block.type === 'tool_result') return renderToolResult(block);
     return '';
   }).join('');
 
   return `
     <div class="message ${role}">
       <div class="message-header">
-        <span>
+        <div class="message-role-wrap">
           <span class="message-role">${role}</span>
-          ${modelBadge}
-        </span>
-        <span>
-          ${usageBadge}
+          ${modelLabel}
+        </div>
+        <div class="message-meta-right">
+          ${tokBadge}
+          ${costBadge}
           <span class="message-time">${escapeHtml(time)}</span>
-        </span>
+        </div>
       </div>
       <div class="message-body">${bodyHtml}</div>
-    </div>
-  `;
+    </div>`;
 }
 
 function renderToolUse(block) {
-  const inputStr = JSON.stringify(block.input, null, 2);
-  const toolId = 'tool-' + Math.random().toString(36).substr(2, 9);
-  // Show a summary of the input
+  const id = 'tool-' + Math.random().toString(36).substr(2,8);
   let summary = '';
-  if (block.name === 'Bash' && block.input.command) {
-    summary = ': ' + escapeHtml(block.input.command.substring(0, 80));
-  } else if (block.name === 'Read' && block.input.file_path) {
-    summary = ': ' + escapeHtml(block.input.file_path);
-  } else if (block.name === 'Write' && block.input.file_path) {
-    summary = ': ' + escapeHtml(block.input.file_path);
-  } else if (block.name === 'Edit' && block.input.file_path) {
-    summary = ': ' + escapeHtml(block.input.file_path);
-  } else if (block.name === 'Grep' && block.input.pattern) {
-    summary = ': ' + escapeHtml(block.input.pattern);
-  } else if (block.name === 'Glob' && block.input.pattern) {
-    summary = ': ' + escapeHtml(block.input.pattern);
-  }
+  const inp = block.input || {};
+  if (block.name === 'Bash' && inp.command) summary = escapeHtml(inp.command.substring(0,90));
+  else if ((block.name === 'Read' || block.name === 'Write' || block.name === 'Edit') && inp.file_path) summary = escapeHtml(inp.file_path);
+  else if (block.name === 'Grep' && inp.pattern) summary = escapeHtml(inp.pattern);
+  else if (block.name === 'Glob' && inp.pattern) summary = escapeHtml(inp.pattern);
 
   return `
     <div class="tool-block">
-      <div class="tool-header" onclick="toggleTool('${toolId}')">
-        <span class="arrow" id="${toolId}-arrow">&#9654;</span>
-        <span class="tool-name">${escapeHtml(block.name)}</span>${summary}
+      <div class="tool-header" onclick="toggleBlock('${id}')">
+        <span class="tool-arrow" id="${id}-arrow">&#9654;</span>
+        <span class="tool-name">${escapeHtml(block.name)}</span>
+        ${summary ? `<span class="tool-summary">${summary}</span>` : ''}
       </div>
-      <div class="tool-body" id="${toolId}" style="display:none">
-        <pre>${escapeHtml(inputStr.substring(0, 5000))}</pre>
+      <div class="tool-body" id="${id}" style="display:none">
+        <pre>${escapeHtml(JSON.stringify(block.input, null, 2).substring(0, 5000))}</pre>
       </div>
-    </div>
-  `;
+    </div>`;
 }
 
 function renderToolResult(block) {
-  const toolId = 'result-' + Math.random().toString(36).substr(2, 9);
+  const id = 'res-' + Math.random().toString(36).substr(2,8);
   const content = block.content || '(empty)';
   return `
     <div class="tool-result-block">
-      <div class="tool-result-header" onclick="toggleTool('${toolId}')">
-        <span class="arrow" id="${toolId}-arrow">&#9654;</span>
+      <div class="tool-result-header" onclick="toggleBlock('${id}')">
+        <span class="tool-arrow" id="${id}-arrow">&#9654;</span>
         Tool Result
       </div>
-      <div class="tool-result-body" id="${toolId}" style="display:none">
+      <div class="tool-result-body" id="${id}" style="display:none">
         <pre>${escapeHtml(content)}</pre>
       </div>
-    </div>
-  `;
+    </div>`;
 }
 
-function toggleTool(id) {
+function toggleBlock(id) {
   const el = document.getElementById(id);
   const arrow = document.getElementById(id + '-arrow');
-  if (el.style.display === 'none') {
-    el.style.display = 'block';
-    arrow.classList.add('open');
-  } else {
-    el.style.display = 'none';
-    arrow.classList.remove('open');
-  }
+  const open = el.style.display === 'none';
+  el.style.display = open ? 'block' : 'none';
+  arrow.classList.toggle('open', open);
+}
+
+function addCopyButtons(container) {
+  container.querySelectorAll('pre').forEach(pre => {
+    if (pre.querySelector('.copy-btn')) return;
+    const btn = document.createElement('button');
+    btn.className = 'copy-btn';
+    btn.textContent = 'Copy';
+    btn.addEventListener('click', () => {
+      const code = pre.querySelector('code');
+      const text = code ? code.textContent : pre.textContent.replace('Copy', '').trim();
+      navigator.clipboard.writeText(text).then(() => {
+        btn.textContent = 'Copied!';
+        btn.classList.add('copied');
+        setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 2000);
+      });
+    });
+    pre.appendChild(btn);
+  });
 }
 
 function renderMarkdown(text) {
   if (typeof marked !== 'undefined') {
-    try {
-      return marked.parse(text);
-    } catch(e) {}
+    try { return marked.parse(text); } catch {}
   }
-  // Fallback: basic escaping with line breaks
-  return '<p>' + escapeHtml(text).replace(/\n/g, '<br>') + '</p>';
+  return '<p>' + escapeHtml(text).replace(/\n/g,'<br>') + '</p>';
 }
 
-function escapeHtml(str) {
-  if (!str) return '';
-  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
-
-// ---- Back (mobile) ----
+// ── Navigation ──
 function goBack() {
   document.getElementById('app').classList.remove('conv-open');
   currentConvId = null;
+  document.getElementById('mainActions').style.display = 'none';
+  document.getElementById('sessionBar').style.display = 'none';
+  document.getElementById('mainTitle').textContent = 'Select a conversation';
+  document.getElementById('messagesContainer').innerHTML = `
+    <div class="empty-state">
+      <div class="empty-icon">&#9670;</div>
+      <div class="empty-title">No conversation selected</div>
+      <div class="empty-hint">Use <kbd style="background:var(--bg-elevated);border:1px solid var(--border);border-radius:3px;padding:1px 5px;font-size:11px;">/</kbd> to search</div>
+    </div>`;
 }
 
-// ---- Copy resume command ----
 function copyResume() {
   if (!currentConvId) return;
-  const cmd = `claude --resume ${currentConvId}`;
-  navigator.clipboard.writeText(cmd).then(() => {
+  navigator.clipboard.writeText(`claude --resume ${currentConvId}`).then(() => {
     const btn = document.getElementById('copyBtn');
     btn.textContent = 'Copied!';
-    setTimeout(() => { btn.textContent = 'Copy resume command'; }, 2000);
+    setTimeout(() => { btn.textContent = 'Copy resume cmd'; }, 2000);
   });
 }
 
-// ---- Export ----
-function exportConversation(format) {
+function exportConversation(fmt) {
   if (!currentConvId) return;
-  window.open(`/api/export/${currentConvId}?format=${format}`, '_blank');
+  window.open(`/api/export/${currentConvId}?format=${fmt}`, '_blank');
 }
 
-// ---- Stats ----
+function exportAll(fmt) {
+  document.getElementById('exportMenu').style.display = 'none';
+  window.open(`/api/export-all?format=${fmt}`, '_blank');
+}
+
+// ── Stats ──
 async function loadStats() {
   const panel = document.getElementById('statsPanel');
-  panel.innerHTML = '<div class="loading"><div class="spinner"></div> Loading stats...</div>';
+  panel.innerHTML = '<div class="loading"><div class="spinner"></div> Loading stats…</div>';
 
   const res = await fetch('/api/stats');
-  const stats = await res.json();
+  const s = await res.json();
 
-  const modelBars = Object.entries(stats.model_usage).map(([model, count]) => {
-    const maxCount = Math.max(...Object.values(stats.model_usage));
-    const pct = (count / maxCount * 100).toFixed(0);
-    return `
-      <div class="bar-row">
-        <div class="bar-label">${escapeHtml(model)}</div>
-        <div class="bar-track"><div class="bar-fill" style="width: ${pct}%">${count}</div></div>
-      </div>
-    `;
+  const totalCost = formatCost(s.total_cost_usd);
+  const heatmapHtml = buildHeatmap(s.daily_activity || {});
+
+  const modelBars = Object.entries(s.model_usage || {}).map(([m, cnt]) => {
+    const max = Math.max(...Object.values(s.model_usage));
+    const pct = (cnt / max * 100).toFixed(0);
+    return `<div class="bar-row">
+      <div class="bar-label" title="${escapeHtml(m)}">${escapeHtml(cleanModelName(m))}</div>
+      <div class="bar-track"><div class="bar-fill" style="width:${pct}%">${cnt}</div></div>
+    </div>`;
   }).join('');
 
-  const projectBars = Object.entries(stats.project_counts).slice(0, 10).map(([proj, count]) => {
-    const maxCount = Math.max(...Object.values(stats.project_counts));
-    const pct = (count / maxCount * 100).toFixed(0);
-    return `
-      <div class="bar-row">
-        <div class="bar-label" title="${escapeHtml(proj)}">${escapeHtml(shortenPath(proj))}</div>
-        <div class="bar-track"><div class="bar-fill" style="width: ${pct}%">${count}</div></div>
-      </div>
-    `;
+  const projectBars = Object.entries(s.project_counts || {}).slice(0,10).map(([p, cnt]) => {
+    const max = Math.max(...Object.values(s.project_counts));
+    const pct = (cnt / max * 100).toFixed(0);
+    return `<div class="bar-row">
+      <div class="bar-label" title="${escapeHtml(p)}">${escapeHtml(shortenPath(p))}</div>
+      <div class="bar-track"><div class="bar-fill" style="width:${pct}%">${cnt}</div></div>
+    </div>`;
   }).join('');
 
   panel.innerHTML = `
-    <h2 style="margin-bottom: 20px; font-size: 20px;">Usage Statistics</h2>
+    <h2>Usage Statistics</h2>
     <div class="stats-grid">
       <div class="stat-card">
-        <div class="stat-value">${stats.total_conversations}</div>
-        <div class="stat-label">Total Conversations</div>
+        <div class="stat-card-icon">&#128172;</div>
+        <div class="stat-value">${s.total_conversations}</div>
+        <div class="stat-label">Conversations</div>
       </div>
       <div class="stat-card">
-        <div class="stat-value">${stats.total_projects}</div>
+        <div class="stat-card-icon">&#128193;</div>
+        <div class="stat-value">${s.total_projects}</div>
         <div class="stat-label">Projects</div>
       </div>
       <div class="stat-card">
-        <div class="stat-value">${formatTokens(stats.total_messages)}</div>
-        <div class="stat-label">Total Messages</div>
+        <div class="stat-card-icon">&#128172;</div>
+        <div class="stat-value">${formatTokens(s.total_messages)}</div>
+        <div class="stat-label">Messages</div>
+      </div>
+      <div class="stat-card cost">
+        <div class="stat-card-icon">&#128178;</div>
+        <div class="stat-value">${totalCost || '$0.00'}</div>
+        <div class="stat-label">Est. Total Cost</div>
       </div>
       <div class="stat-card">
-        <div class="stat-value">${formatTokens(stats.total_tokens)}</div>
-        <div class="stat-label">Total Tokens</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-value">${formatTokens(stats.total_input_tokens)}</div>
+        <div class="stat-card-icon">&#8595;</div>
+        <div class="stat-value">${formatTokens(s.total_input_tokens)}</div>
         <div class="stat-label">Input Tokens</div>
       </div>
       <div class="stat-card">
-        <div class="stat-value">${formatTokens(stats.total_output_tokens)}</div>
+        <div class="stat-card-icon">&#8593;</div>
+        <div class="stat-value">${formatTokens(s.total_output_tokens)}</div>
         <div class="stat-label">Output Tokens</div>
       </div>
       <div class="stat-card">
-        <div class="stat-value">${formatTokens(stats.total_cache_creation_tokens)}</div>
-        <div class="stat-label">Cache Creation Tokens</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-value">${formatTokens(stats.total_cache_read_tokens)}</div>
+        <div class="stat-card-icon">&#9400;</div>
+        <div class="stat-value">${formatTokens(s.total_cache_read_tokens)}</div>
         <div class="stat-label">Cache Read Tokens</div>
       </div>
+      <div class="stat-card">
+        <div class="stat-card-icon">&#128190;</div>
+        <div class="stat-value">${formatTokens(s.total_cache_creation_tokens)}</div>
+        <div class="stat-label">Cache Created</div>
+      </div>
     </div>
+
     <div class="stats-section">
-      <h3>Model Usage (conversations per model)</h3>
+      <h3>Activity — last 52 weeks</h3>
+      <div class="heatmap-container">${heatmapHtml}</div>
+    </div>
+
+    <div class="stats-section">
+      <h3>Model Usage</h3>
       <div class="stats-bar-chart">${modelBars || '<div style="color:var(--text-muted)">No data</div>'}</div>
     </div>
+
     <div class="stats-section">
-      <h3>Top Projects (conversations per project)</h3>
+      <h3>Top Projects</h3>
       <div class="stats-bar-chart">${projectBars || '<div style="color:var(--text-muted)">No data</div>'}</div>
-    </div>
-  `;
+    </div>`;
+}
+
+function buildHeatmap(daily) {
+  const today = new Date();
+  const totalDays = 364;
+  const cells = [];
+  for (let i = totalDays; i >= 0; i--) {
+    const d = new Date(today);
+    d.setDate(today.getDate() - i);
+    const key = d.toISOString().split('T')[0];
+    cells.push({date: key, count: daily[key] || 0});
+  }
+
+  const max = Math.max(...cells.map(c => c.count), 1);
+  const weeks = [];
+  for (let i = 0; i < cells.length; i += 7) weeks.push(cells.slice(i, i+7));
+
+  const weeksHtml = weeks.map(week =>
+    `<div class="heatmap-week">${week.map(day => {
+      const lvl = day.count === 0 ? 0 : Math.min(4, Math.ceil(day.count / max * 4));
+      return `<div class="heatmap-cell${lvl > 0 ? ' l'+lvl : ''}" title="${escapeHtml(day.date)}: ${day.count} conversation${day.count !== 1 ? 's' : ''}"></div>`;
+    }).join('')}</div>`
+  ).join('');
+
+  const legend = `<div style="display:flex;align-items:center;gap:4px;margin-top:8px;font-size:11px;color:var(--text-muted);">
+    Less <div class="heatmap-cell" style="display:inline-block"></div>
+    <div class="heatmap-cell l1" style="display:inline-block"></div>
+    <div class="heatmap-cell l2" style="display:inline-block"></div>
+    <div class="heatmap-cell l3" style="display:inline-block"></div>
+    <div class="heatmap-cell l4" style="display:inline-block"></div> More
+  </div>`;
+
+  return `<div class="heatmap">${weeksHtml}</div>${legend}`;
 }
 </script>
 </body>
 </html>"""
 
 # ---------------------------------------------------------------------------
-# Main
+# Service management
 # ---------------------------------------------------------------------------
 
 def _get_plist_path() -> Path:
     return Path.home() / "Library" / "LaunchAgents" / "com.claude-conversation-viewer.plist"
 
 
-def _get_script_path() -> str:
-    return os.path.abspath(__file__)
-
-
 def install_service(port: int):
-    """Install a macOS LaunchAgent to auto-start on login."""
     if platform.system() != "Darwin":
-        print("[ERROR] Auto-start is currently supported on macOS only.")
-        print("        On Linux, add this to your crontab:")
-        print(f"        @reboot python3 {_get_script_path()} --port {port} --no-open &")
+        print("[ERROR] --install is macOS-only. For Linux use --install-systemd.")
         return
-
     plist_path = _get_plist_path()
-    script = _get_script_path()
     python = sys.executable
-
+    script = os.path.abspath(__file__)
     plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.claude-conversation-viewer</string>
+<plist version="1.0"><dict>
+    <key>Label</key><string>com.claude-conversation-viewer</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{python}</string>
-        <string>{script}</string>
-        <string>--port</string>
-        <string>{port}</string>
-        <string>--no-open</string>
+        <string>{python}</string><string>{script}</string>
+        <string>--port</string><string>{port}</string><string>--no-open</string>
     </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <false/>
-    <key>StandardOutPath</key>
-    <string>/tmp/claude-conversation-viewer.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/claude-conversation-viewer.log</string>
-</dict>
-</plist>
-"""
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><false/>
+    <key>StandardOutPath</key><string>/tmp/claude-conversation-viewer.log</string>
+    <key>StandardErrorPath</key><string>/tmp/claude-conversation-viewer.log</string>
+</dict></plist>"""
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     plist_path.write_text(plist_content)
-
-    # Load the service
     os.system(f"launchctl unload {plist_path} 2>/dev/null")
     os.system(f"launchctl load {plist_path}")
-
-    print(f"\n  Service installed and started!")
-    print(f"  ================================")
-    print(f"  URL:       http://127.0.0.1:{port}")
-    print(f"  Plist:     {plist_path}")
-    print(f"  Log:       /tmp/claude-conversation-viewer.log")
-    print(f"  Auto-starts on login.\n")
-    print(f"  To stop:   python3 {script} --uninstall")
-    print(f"  To check:  launchctl list | grep claude-conversation\n")
+    print(f"\n  Service installed and started at http://127.0.0.1:{port}")
+    print(f"  Plist: {plist_path}")
+    print(f"  Log:   /tmp/claude-conversation-viewer.log\n")
 
 
 def uninstall_service():
-    """Remove the macOS LaunchAgent."""
     if platform.system() != "Darwin":
-        print("[INFO] Remove the crontab entry manually: crontab -e")
+        print("[INFO] For Linux, remove the systemd unit manually.")
         return
-
     plist_path = _get_plist_path()
     if plist_path.exists():
         os.system(f"launchctl unload {plist_path} 2>/dev/null")
@@ -1796,13 +2469,51 @@ def uninstall_service():
         print("\n  No service installed.\n")
 
 
+def install_systemd_service(port: int):
+    service_dir = Path.home() / ".config" / "systemd" / "user"
+    service_dir.mkdir(parents=True, exist_ok=True)
+    service_path = service_dir / "claude-conversation-viewer.service"
+    python = sys.executable
+    service_content = f"""[Unit]
+Description=Claude Code Conversation Viewer
+After=network.target
+
+[Service]
+ExecStart={python} -m claude_conversation_viewer.web --port {port} --no-open
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+"""
+    service_path.write_text(service_content)
+    print(f"\n  Systemd service written to: {service_path}")
+    print(f"\n  Enable and start with:")
+    print(f"    systemctl --user daemon-reload")
+    print(f"    systemctl --user enable claude-conversation-viewer")
+    print(f"    systemctl --user start claude-conversation-viewer\n")
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 def main():
     parser = argparse.ArgumentParser(description="Claude Code Conversation Viewer")
-    parser.add_argument("--port", type=int, default=5005, help="Port to serve on (default: 5005)")
-    parser.add_argument("--no-open", action="store_true", help="Don't auto-open browser")
-    parser.add_argument("--install", action="store_true", help="Install as background service (auto-start on login)")
-    parser.add_argument("--uninstall", action="store_true", help="Remove background service")
+    parser.add_argument("--port", type=int, default=5005)
+    parser.add_argument("--no-open", action="store_true")
+    parser.add_argument("--install", action="store_true", help="Install macOS LaunchAgent")
+    parser.add_argument("--uninstall", action="store_true", help="Remove macOS LaunchAgent")
+    parser.add_argument("--install-systemd", action="store_true", help="Install Linux systemd user service")
+    parser.add_argument("--update", action="store_true", help="Update to latest version from PyPI")
     args = parser.parse_args()
+
+    if args.update:
+        import subprocess
+        print("Updating claude-conversation-viewer...")
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--upgrade", "claude-conversation-viewer"]
+        )
+        sys.exit(result.returncode)
 
     if args.uninstall:
         uninstall_service()
@@ -1812,17 +2523,21 @@ def main():
         install_service(args.port)
         return
 
+    if args.install_systemd:
+        install_systemd_service(args.port)
+        return
+
     STORE.load()
 
     server = HTTPServer(("127.0.0.1", args.port), Handler)
     url = f"http://127.0.0.1:{args.port}"
 
-    print(f"\n  Claude Code Conversation Viewer")
-    print(f"  ================================")
-    print(f"  {len(STORE.conversations)} conversations from {len(STORE.projects)} projects")
+    print(f"\n  Claude Code Conversation Viewer  v2.0")
+    print(f"  ═══════════════════════════════════════")
+    print(f"  {len(STORE.conversations)} conversations · {len(STORE.projects)} projects")
     print(f"  Running at: {url}")
     print(f"  Press Ctrl+C to stop")
-    print(f"  Tip: run with --install to auto-start on login\n")
+    print(f"  Tip: --install (macOS) or --install-systemd (Linux) to auto-start\n")
 
     if not args.no_open:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()

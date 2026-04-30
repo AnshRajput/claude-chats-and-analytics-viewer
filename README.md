@@ -66,7 +66,7 @@ Partial session IDs work too -- `--view 4925f6c7` matches `4925f6c7-35f2-4340-ba
 ### Install from source
 
 ```bash
-git clone https://github.com/eazyapp-tech/claude-conversation-viewer.git
+git clone https://github.com/AnshRajput/Claude-Conversation-viewer.git
 cd claude-conversation-viewer
 pip install .
 ```
