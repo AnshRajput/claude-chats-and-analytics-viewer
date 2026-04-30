@@ -11,48 +11,27 @@ Browse, search, and resume your [Claude Code](https://docs.anthropic.com/en/docs
 
 ## Install & Run
 
-### macOS
+### macOS / Linux
 
 ```bash
-# Step 1 — install pipx (skip if you already have it)
-brew install pipx && pipx ensurepath
-
-# Step 2 — open a new terminal, then install and run
-pipx install claude-chats-and-analytics-viewer
-ccv
-```
-
-### Linux
-
-```bash
-# Step 1 — install pipx
-python3 -m pip install --user pipx
-python3 -m pipx ensurepath
-
-# Step 2 — open a new terminal, then install and run
-pipx install claude-chats-and-analytics-viewer
-ccv
+curl -fsSL https://raw.githubusercontent.com/AnshRajput/claude-chats-and-analytics-viewer/main/install.sh | sh
 ```
 
 ### Windows (PowerShell)
 
 ```powershell
-# Step 1 — install pipx
-pip install pipx
-pipx ensurepath
-
-# Step 2 — open a new terminal, then install and run
-pipx install claude-chats-and-analytics-viewer
-ccv
+iwr https://raw.githubusercontent.com/AnshRajput/claude-chats-and-analytics-viewer/main/install.ps1 | iex
 ```
 
-Opens `http://127.0.0.1:5005` in your browser.
+That's it. Opens `http://127.0.0.1:5005` in your browser.
 
-### Alternatives
+The installer auto-detects your system, installs `pipx` if needed, and launches the viewer.
+
+### Manual install (if you prefer)
 
 ```bash
-uvx claude-chats-and-analytics-viewer                      # uv — no install needed
-curl -fsSL https://raw.githubusercontent.com/AnshRajput/claude-chats-and-analytics-viewer/main/install.sh | sh  # shell script
+pipx install claude-chats-and-analytics-viewer && ccv   # pipx
+uvx claude-chats-and-analytics-viewer                   # uv (no install needed)
 ```
 
 ---
