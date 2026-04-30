@@ -75,16 +75,49 @@ The viewer auto-detects the correct path on each platform.
 
 ## Installation
 
-### Install from PyPI
+### macOS
 
 ```bash
-pipx install claude-chats-and-analytics-viewer && ccv
+# Step 1 — install pipx (skip if already installed)
+brew install pipx && pipx ensurepath
+
+# Step 2 — open a new terminal, then:
+pipx install claude-chats-and-analytics-viewer
+ccv
 ```
 
-> **macOS / Homebrew users:** Use `pipx` — Homebrew Python blocks system-wide pip installs (PEP 668).
-> Install pipx with: `brew install pipx && pipx ensurepath`
+> Homebrew Python enforces PEP 668 and blocks system-wide `pip install`.
+> `pipx` is the correct tool for installing Python CLI apps on macOS.
 
-This installs the following commands:
+### Linux
+
+```bash
+# Step 1 — install pipx
+python3 -m pip install --user pipx
+python3 -m pipx ensurepath
+
+# Step 2 — open a new terminal, then:
+pipx install claude-chats-and-analytics-viewer
+ccv
+```
+
+> On Ubuntu/Debian you can also use: `sudo apt install pipx`
+
+### Windows (PowerShell)
+
+```powershell
+# Step 1 — install pipx
+pip install pipx
+pipx ensurepath
+
+# Step 2 — open a new terminal, then:
+pipx install claude-chats-and-analytics-viewer
+ccv
+```
+
+> Make sure Python is installed from https://python.org (check "Add to PATH" during install).
+
+### Installed commands
 
 | Command | Description |
 |---|---|
@@ -93,11 +126,12 @@ This installs the following commands:
 | `claude-dashboard` | Start Web UI |
 | `claude-conversations-cli` | Start the terminal CLI |
 
-> **Alternatives:**
-> ```bash
-> pip3 install --user claude-chats-and-analytics-viewer   # pip with --user flag
-> uvx claude-chats-and-analytics-viewer                   # uv (no install needed)
-> ```
+### Alternatives (no pipx needed)
+
+```bash
+uvx claude-chats-and-analytics-viewer          # uv — runs without installing
+pip3 install --user claude-chats-and-analytics-viewer  # pip --user flag
+```
 
 ### Install from Source
 
@@ -112,11 +146,6 @@ pipx install .
 ```bash
 ccv --help
 claude-conversations-cli --help
-```
-
-Check the installed version:
-
-```bash
 python3 -c "from claude_conversation_viewer import __version__; print(__version__)"
 ```
 
