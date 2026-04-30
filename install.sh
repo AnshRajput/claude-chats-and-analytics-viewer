@@ -11,8 +11,8 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "  Installing via pip..."
-python3 -m pip install --quiet --upgrade claude-conversation-viewer
+echo "  Installing via pip3..."
+pip3 install --quiet --upgrade claude-chats-and-analytics-viewer
 
 echo "  Done! Starting viewer..."
 echo ""

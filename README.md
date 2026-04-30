@@ -12,7 +12,7 @@ Browse, search, and resume your [Claude Code](https://docs.anthropic.com/en/docs
 ## One-command install & run
 
 ```bash
-pip install claude-chats-and-analytics-viewer && ccv
+pip3 install claude-chats-and-analytics-viewer && ccv
 ```
 
 That's it. Opens `http://127.0.0.1:5005` in your browser.

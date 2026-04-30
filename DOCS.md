@@ -52,7 +52,7 @@ Both interfaces are zero-dependency (Python standard library only), cross-platfo
 |---|---|
 | **Python** | 3.7 or later |
 | **Claude Code** | Installed and used at least once (so `~/.claude/projects/` exists with conversation files) |
-| **pip** | For PyPI installation (included with Python 3.4+) |
+| **pip3** | For PyPI installation (use `pip3` on macOS/Linux, `pip` on Windows) |
 | **Claude Code CLI** | Required only for the `--resume` / `r` command to jump back into a conversation |
 
 ### Where Claude Code stores conversations
@@ -78,7 +78,7 @@ The viewer auto-detects the correct path on each platform.
 ### Install from PyPI
 
 ```bash
-pip install claude-chats-and-analytics-viewer && ccv
+pip3 install claude-chats-and-analytics-viewer && ccv
 ```
 
 This installs the following commands:
@@ -90,7 +90,7 @@ This installs the following commands:
 | `claude-dashboard` | Start Web UI |
 | `claude-conversations-cli` | Start the terminal CLI |
 
-> **Note:** If pip installs scripts to a directory not on your PATH (e.g., `~/.local/bin` on Linux or `~/Library/Python/3.x/bin` on macOS), add it:
+> **Note:** If pip3 installs scripts to a directory not on your PATH (e.g., `~/.local/bin` on Linux or `~/Library/Python/3.x/bin` on macOS), add it:
 > ```bash
 > export PATH="$HOME/.local/bin:$PATH"
 > ```
@@ -100,7 +100,7 @@ This installs the following commands:
 ```bash
 git clone https://github.com/AnshRajput/claude-chats-and-analytics-viewer.git
 cd claude-chats-and-analytics-viewer
-pip install .
+pip3 install .
 ```
 
 ### Verify Installation
@@ -283,7 +283,7 @@ To update manually:
 ```bash
 ccv --update
 # or
-pip install --upgrade claude-chats-and-analytics-viewer
+pip3 install --upgrade claude-chats-and-analytics-viewer
 ```
 
 ---
@@ -359,7 +359,7 @@ ccv --port 8080
 lsof -i :5005 && kill <PID>
 ```
 
-### Commands not found after pip install
+### Commands not found after pip3 install
 
 ```bash
 python3 -m site --user-base
