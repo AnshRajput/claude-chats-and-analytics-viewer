@@ -16,9 +16,9 @@ from urllib.error import URLError
 
 from claude_conversation_viewer import __version__
 
-PACKAGE_NAME = "claude-conversation-viewer"
+PACKAGE_NAME = "claude-chats-and-analytics-viewer"
 PYPI_URL = f"https://pypi.org/pypi/{PACKAGE_NAME}/json"
-CACHE_FILE = Path(tempfile.gettempdir()) / "claude-viewer-update-check"
+CACHE_FILE = Path(tempfile.gettempdir()) / "claude-viewer-update-check-v2"
 CHECK_INTERVAL = 3600  # 1 hour
 
 
