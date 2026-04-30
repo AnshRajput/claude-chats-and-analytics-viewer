@@ -10,7 +10,7 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.7"
 authors = [
-    {name = "EazyApp Tech", email = "tech@eazyapp.com"},
+    {name = "Ansh Singh Rajput", email = "anshgandharva.dev@gmail.com"},
 ]
 keywords = ["claude", "claude-code", "conversation", "viewer", "anthropic"]
 classifiers = [
@@ -32,14 +32,15 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/eazyapp-tech/claude-conversation-viewer"
-Repository = "https://github.com/eazyapp-tech/claude-conversation-viewer"
-Issues = "https://github.com/eazyapp-tech/claude-conversation-viewer/issues"
+Homepage = "https://github.com/AnshRajput/Claude-Conversation-viewer"
+Repository = "https://github.com/AnshRajput/Claude-Conversation-viewer"
+Issues = "https://github.com/AnshRajput/Claude-Conversation-viewer/issues"
 
 [project.scripts]
 claude-conversations = "claude_conversation_viewer.web:main"
 claude-conversations-cli = "claude_conversation_viewer.cli:main"
 claude-dashboard = "claude_conversation_viewer.web:main"
+ccv = "claude_conversation_viewer.web:main"
 
 [tool.setuptools.packages.find]
 include = ["claude_conversation_viewer*"]
