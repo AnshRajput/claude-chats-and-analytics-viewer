@@ -2529,8 +2529,18 @@ def main():
 
     STORE.load()
 
-    server = HTTPServer(("127.0.0.1", args.port), Handler)
-    url = f"http://127.0.0.1:{args.port}"
+    port = args.port
+    try:
+        server = HTTPServer(("127.0.0.1", port), Handler)
+    except OSError:
+        # Port busy — find the next free one automatically
+        import socket
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        print(f"\n  Port {args.port} is already in use — switching to port {port}")
+        server = HTTPServer(("127.0.0.1", port), Handler)
+    url = f"http://127.0.0.1:{port}"
 
     print(f"\n  Claude Code Conversation Viewer  v2.0")
     print(f"  ═══════════════════════════════════════")
