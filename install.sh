@@ -55,5 +55,8 @@ if command -v python3 >/dev/null 2>&1; then
   exec "$HOME/.local/bin/ccv"
 fi
 
-echo "  [ERROR] Python 3 not found. Install it from https://python.org"
+echo "  [ERROR] No installer found. Install uv or pipx first:"
+echo "    macOS:  brew install pipx && pipx ensurepath"
+echo "    Linux:  python3 -m pip install --user pipx"
+echo "    uv:     curl -LsSf https://astral.sh/uv/install.sh | sh"
 exit 1
