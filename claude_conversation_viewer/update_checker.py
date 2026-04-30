@@ -80,10 +80,9 @@ def check_for_update_sync() -> dict:
     return _do_check()
 
 
-def check_for_update_async(callback: Callable[[bool], None]):
+def check_for_update_async(callback: Callable[[dict], None]):
     def _run():
-        result = _do_check()
-        callback(result.get("update_available", False))
+        callback(_do_check())
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()

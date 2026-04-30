@@ -1647,7 +1647,7 @@ pre:hover .copy-btn { opacity: 1; }
 <body>
 
 <div class="update-banner" id="updateBanner">
-  <span>&#10022; Update available! Run <code>ccv --update</code> in your terminal to get the latest version.</span>
+  <span id="updateBannerText">&#10022; Update available! Run <code>ccv --update</code> in your terminal to get the latest version.</span>
   <button class="dismiss-btn" onclick="dismissUpdate()" title="Dismiss">&times;</button>
 </div>
 
@@ -1811,7 +1811,13 @@ async function checkForUpdate() {
   try {
     const r = await fetch('/api/update-check');
     const d = await r.json();
-    if (d.update_available) document.getElementById('updateBanner').classList.add('show');
+    if (d.update_available) {
+      const verStr = (d.current_version && d.latest_version)
+        ? ` v${d.current_version} → v${d.latest_version}` : '';
+      document.getElementById('updateBannerText').innerHTML =
+        `&#10022; Update available!${verStr}  Run <code>ccv --update</code> to get the latest version.`;
+      document.getElementById('updateBanner').classList.add('show');
+    }
   } catch {}
 }
 function dismissUpdate() {

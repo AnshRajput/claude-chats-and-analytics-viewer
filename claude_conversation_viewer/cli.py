@@ -30,11 +30,12 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 try:
-    from claude_conversation_viewer.update_checker import check_for_update_async
+    from claude_conversation_viewer.update_checker import check_for_update_async, check_for_update_sync
 except ImportError:
     check_for_update_async = None
+    check_for_update_sync = None
 
-_update_available = False
+_update_info: dict = {}
 
 # ---------------------------------------------------------------------------
 # Terminal colors (works on macOS, Linux, Windows 10+)
@@ -693,8 +694,11 @@ def interactive_mode(conversations: list, is_search: bool = False):
     while True:
         if first_run and not is_search:
             print_welcome(len(conversations))
-            if _update_available:
-                print(f"  {C.LAVENDER}  ✦ Update available! Run: {C.GOLD}pip install --upgrade claude-conversation-viewer{C.RESET}")
+            if _update_info.get("update_available"):
+                current = _update_info.get("current_version", "")
+                latest = _update_info.get("latest_version", "")
+                ver_str = f" v{current} → v{latest}" if current and latest else ""
+                print(f"  {C.LAVENDER}  ✦ Update available!{ver_str}  Run: {C.GOLD}pip install --upgrade claude-chats-and-analytics-viewer{C.RESET}")
                 print()
             first_run = False
 
@@ -871,6 +875,7 @@ def main():
               %(prog)s --view <session-id>      View a conversation
               %(prog)s --resume <session-id>    Resume in Claude Code
               %(prog)s --list                   Non-interactive list
+              %(prog)s --check-update           Check for available updates
         """),
     )
     parser.add_argument("--list", action="store_true", help="List all conversations (non-interactive)")
@@ -879,12 +884,31 @@ def main():
     parser.add_argument("--view", type=str, metavar="SESSION_ID", help="View a conversation by session ID")
     parser.add_argument("--resume", type=str, metavar="SESSION_ID", help="Resume a conversation in Claude Code")
     parser.add_argument("--limit", type=int, default=50, help="Max conversations to show in --list mode (default: 50)")
+    parser.add_argument("--check-update", action="store_true", help="Check for available updates and show current vs latest version")
     args = parser.parse_args()
 
+    # --check-update: synchronous check, print result, exit
+    if args.check_update:
+        if check_for_update_sync is None:
+            print(f"{C.RED}Update checker not available.{C.RESET}")
+            sys.exit(1)
+        result = check_for_update_sync()
+        current = result.get("current_version", "unknown")
+        latest = result.get("latest_version", current)
+        print(f"\n  {C.BOLD}Claude Conversation Viewer — update check{C.RESET}")
+        print(f"  {C.GRAY}Current version :{C.RESET} {C.WHITE}v{current}{C.RESET}")
+        print(f"  {C.GRAY}Latest version  :{C.RESET} {C.WHITE}v{latest}{C.RESET}")
+        if result.get("update_available"):
+            print(f"  {C.GRAY}Status          :{C.RESET} {C.LAVENDER}Update available!{C.RESET}")
+            print(f"\n  {C.GOLD}pip install --upgrade claude-chats-and-analytics-viewer{C.RESET}\n")
+        else:
+            print(f"  {C.GRAY}Status          :{C.RESET} {C.GREEN}You're up to date{C.RESET}\n")
+        sys.exit(0)
+
     # Start background update check
-    def _on_update_result(available):
-        global _update_available
-        _update_available = available
+    def _on_update_result(result):
+        global _update_info
+        _update_info = result
 
     if check_for_update_async is not None:
         check_for_update_async(_on_update_result)
@@ -945,8 +969,11 @@ def main():
         conversations = conversations[:args.limit]
         print_conversation_list(conversations, page=0, page_size=len(conversations))
         print(f"  {C.DIM}Resume any conversation:{C.RESET} claude --resume <session-id>")
-        if _update_available:
-            print(f"  {C.LAVENDER}✦ Update available! Run: {C.GOLD}pip install --upgrade claude-conversation-viewer{C.RESET}")
+        if _update_info.get("update_available"):
+            current = _update_info.get("current_version", "")
+            latest = _update_info.get("latest_version", "")
+            ver_str = f" v{current} → v{latest}" if current and latest else ""
+            print(f"  {C.LAVENDER}✦ Update available!{ver_str}  Run: {C.GOLD}pip install --upgrade claude-chats-and-analytics-viewer{C.RESET}")
         print()
         return
 
