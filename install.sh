@@ -8,13 +8,14 @@ echo "  Claude Chats & Analytics Viewer"
 echo "  ================================"
 echo ""
 
-# ── 1. Try uv (already installed) — fastest, no permanent install ────────────
+# ── 1. Try uv (already installed) ────────────────────────────────────────────
 if command -v uv >/dev/null 2>&1; then
   echo "  [1/2] Installing via uv..."
   uv tool install "$PKG" --quiet 2>/dev/null || uv tool upgrade "$PKG" --quiet
   echo "  [2/2] Done!"
   echo ""
-  exec uv tool run --from "$PKG" ccv
+  # uv installs tool binaries to ~/.local/bin
+  exec "${HOME}/.local/bin/ccv"
 fi
 
 # ── 2. Try pipx (already installed) ──────────────────────────────────────────
