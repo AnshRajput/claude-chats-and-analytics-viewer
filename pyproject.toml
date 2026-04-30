@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-chats-and-analytics-viewer"
-version = "2.0.4"
+version = "2.0.5"
 description = "Browse, search, and resume your Claude Code conversations -- from the browser or the terminal."
 readme = "README.md"
 license = "MIT"
