@@ -5,11 +5,14 @@ Claude Code Conversation Viewer - CLI
 Browse, search, and resume your Claude Code conversations from the terminal.
 
 Usage:
-    python3 claude_conversations_cli.py                  # interactive list
-    python3 claude_conversations_cli.py --search "auth"  # search conversations
-    python3 claude_conversations_cli.py --project "rent"  # filter by project
-    python3 claude_conversations_cli.py --view <id>      # view a conversation
-    python3 claude_conversations_cli.py --resume <id>    # resume in Claude Code
+    ccv -v / --version                    # show version and exit
+    ccv --check-update                    # check for available updates
+    ccv                                   # interactive browser
+    ccv --search "auth"                   # search conversations
+    ccv --project "rent"                  # filter by project
+    ccv --view <id>                       # view a conversation
+    ccv --resume <id>                     # resume in Claude Code
+    ccv --list                            # non-interactive list
 
 Requirements: Python 3.7+ (no pip install needed)
 Works on: macOS, Windows, Linux
@@ -869,13 +872,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Examples:
+              %(prog)s -v                       Show version and exit
+              %(prog)s --check-update           Check for available updates
               %(prog)s                          Interactive browser
               %(prog)s --search "auth"          Search conversations
               %(prog)s --project "rentok"       Filter by project name
               %(prog)s --view <session-id>      View a conversation
               %(prog)s --resume <session-id>    Resume in Claude Code
               %(prog)s --list                   Non-interactive list
-              %(prog)s --check-update           Check for available updates
         """),
     )
     parser.add_argument("-v", "--version", action="store_true", help="Show current version and exit")
