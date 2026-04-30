@@ -5,14 +5,14 @@ Claude Code Conversation Viewer - CLI
 Browse, search, and resume your Claude Code conversations from the terminal.
 
 Usage:
-    ccv -v / --version                    # show version and exit
-    ccv --check-update                    # check for available updates
-    ccv                                   # interactive browser
-    ccv --search "auth"                   # search conversations
-    ccv --project "rent"                  # filter by project
-    ccv --view <id>                       # view a conversation
-    ccv --resume <id>                     # resume in Claude Code
-    ccv --list                            # non-interactive list
+    ccvc -v / --version                   # show version and exit
+    ccvc --check-update                   # check for available updates
+    ccvc                                  # interactive browser
+    ccvc --search "auth"                  # search conversations
+    ccvc --project "rent"                 # filter by project
+    ccvc --view <id>                      # view a conversation
+    ccvc --resume <id>                    # resume in Claude Code
+    ccvc --list                           # non-interactive list
 
 Requirements: Python 3.7+ (no pip install needed)
 Works on: macOS, Windows, Linux
@@ -872,14 +872,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Examples:
-              %(prog)s -v                       Show version and exit
-              %(prog)s --check-update           Check for available updates
-              %(prog)s                          Interactive browser
-              %(prog)s --search "auth"          Search conversations
-              %(prog)s --project "rentok"       Filter by project name
-              %(prog)s --view <session-id>      View a conversation
-              %(prog)s --resume <session-id>    Resume in Claude Code
-              %(prog)s --list                   Non-interactive list
+              ccvc -v                           Show version and exit
+              ccvc --check-update               Check for available updates
+              ccvc                              Interactive browser
+              ccvc --search "auth"              Search conversations
+              ccvc --project "rentok"           Filter by project name
+              ccvc --view <session-id>          View a conversation
+              ccvc --resume <session-id>        Resume in Claude Code
+              ccvc --list                       Non-interactive list
         """),
     )
     parser.add_argument("-v", "--version", action="store_true", help="Show current version and exit")

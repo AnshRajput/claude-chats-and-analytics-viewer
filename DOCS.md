@@ -121,10 +121,11 @@ ccv
 
 | Command | Description |
 |---|---|
-| `ccv` | Start Web UI (shortest alias) |
-| `claude-conversations` | Start Web UI |
-| `claude-dashboard` | Start Web UI |
-| `claude-conversations-cli` | Start the terminal CLI |
+| `ccv` | Start Web UI |
+| `ccvc` | Start terminal CLI |
+| `claude-conversations` | Start Web UI (alias) |
+| `claude-dashboard` | Start Web UI (alias) |
+| `claude-conversations-cli` | Start terminal CLI (alias) |
 
 ### Alternatives (no pipx needed)
 
@@ -145,7 +146,8 @@ pipx install .
 
 ```bash
 ccv --help
-claude-conversations-cli --help
+ccvc --help
+ccvc -v
 python3 -c "from claude_conversation_viewer import __version__; print(__version__)"
 ```
 
@@ -253,7 +255,7 @@ ccv --install-systemd
 ### Interactive Mode
 
 ```bash
-claude-conversations-cli
+ccvc
 ```
 
 Launches an interactive terminal browser with a styled banner, paginated list, search, and conversation viewer.
@@ -262,6 +264,8 @@ Launches an interactive terminal browser with a styled banner, paginated list, s
 
 | Flag | Description |
 |---|---|
+| `-v`, `--version` | Show current version and exit |
+| `--check-update` | Check for available updates (shows current vs latest) |
 | `--list` | Print conversations non-interactively (pipe-friendly) |
 | `--search QUERY` | Filter by keyword |
 | `--project NAME` | Filter by project name |
@@ -288,16 +292,16 @@ Session ID prefixes work as targets: `r 4925f6c7`
 ### Non-interactive Usage
 
 ```bash
-claude-conversations-cli --list
-claude-conversations-cli --search "database migration" --list
-claude-conversations-cli --view 4925f6c7
-claude-conversations-cli --list --limit 10
+ccvc --list
+ccvc --search "database migration" --list
+ccvc --view 4925f6c7
+ccvc --list --limit 10
 ```
 
 ### Resuming Conversations
 
 ```bash
-claude-conversations-cli --resume 4925f6c7
+ccvc --resume 4925f6c7
 ```
 
 Runs `claude --resume <session-id>`. Requires Claude Code CLI on your PATH.
@@ -306,15 +310,16 @@ Runs `claude --resume <session-id>`. Requires Claude Code CLI on your PATH.
 
 ## Update Notifications
 
-The tool checks for new versions on PyPI at most once per hour. When an update is available:
+The tool checks for new versions on PyPI at most once per hour (cached). When an update is available:
 
-- **Web UI** — a banner appears at the top of the page with the update command.
-- **CLI** — a one-line notice appears after the welcome banner.
+- **Web UI** — a banner with current → latest version and an **Update Now** button appears at the top. You can also go to **⚙ Settings** tab for a full version panel with a Check for Updates button.
+- **CLI** — a one-line notice with the version range (`v2.x.x → v2.y.y`) appears after the welcome banner.
 
-To update manually:
+To check or update manually:
 
 ```bash
-ccv --update
+ccvc --check-update               # show current vs latest version
+ccv --update                      # update via web UI command
 # or
 pipx upgrade claude-chats-and-analytics-viewer
 ```
@@ -352,7 +357,9 @@ All data stays local — nothing is sent anywhere.
 | `/api/search?q=<query>` | GET | Full-text content search |
 | `/api/bookmarks` | GET / POST | Get or toggle bookmarks |
 | `/api/status` | GET | Server heartbeat for auto-refresh |
-| `/api/update-check` | GET | `{"update_available": true/false, ...}` |
+| `/api/update-check` | GET | `{"update_available": true/false, "current_version": "...", "latest_version": "..."}` |
+| `/api/settings` | GET | Version, package name, projects dir, conversation count, update info |
+| `/api/do-update` | POST | Run pip/pipx/uv upgrade in-place, returns `{"ok": true/false}` |
 
 ---
 
@@ -415,7 +422,7 @@ python3 -m claude_conversation_viewer.cli
 
 ### Update check not working
 
-Requires network access to `pypi.org`. Fails silently by design — never blocks startup. Manually run `ccv --update` instead.
+Requires network access to `pypi.org`. Fails silently by design — never blocks startup. Run `ccvc --check-update` or `ccv --update` to check/update manually.
 
 ---
 

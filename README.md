@@ -99,16 +99,18 @@ ccv --install-systemd      # auto-start on login (Linux systemd)
 ccv --uninstall            # remove the auto-start service
 ```
 
-### Terminal CLI (`claude-conversations-cli`)
+### Terminal CLI (`ccvc`)
 
 ```bash
-claude-conversations-cli                          # interactive browser
-claude-conversations-cli --search "auth bug"      # search by keyword
-claude-conversations-cli --project "myapp"        # filter by project
-claude-conversations-cli --view <session-id>      # view a conversation
-claude-conversations-cli --resume <session-id>    # resume in Claude Code
-claude-conversations-cli --list                   # non-interactive list (pipe-friendly)
-claude-conversations-cli --list --limit 10        # limit results
+ccvc                              # interactive browser
+ccvc -v                           # show version and exit
+ccvc --check-update               # check for available updates
+ccvc --search "auth bug"          # search by keyword
+ccvc --project "myapp"            # filter by project
+ccvc --view <session-id>          # view a conversation
+ccvc --resume <session-id>        # resume in Claude Code
+ccvc --list                       # non-interactive list (pipe-friendly)
+ccvc --list --limit 10            # limit results
 ```
 
 ### Interactive CLI keyboard commands
@@ -130,12 +132,13 @@ claude-conversations-cli --list --limit 10        # limit results
 ## Update
 
 ```bash
-ccv --update
+ccv --update                                      # update via web UI command
+ccvc --check-update                               # check current vs latest version
 # or
 pipx upgrade claude-chats-and-analytics-viewer
 ```
 
-When an update is available, a banner appears in the Web UI and a notice prints in the CLI automatically.
+When an update is available, a banner with an **Update Now** button appears in the Web UI, and a notice prints in the CLI automatically.
 
 ---
 
