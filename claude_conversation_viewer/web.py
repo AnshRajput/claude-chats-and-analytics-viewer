@@ -1642,7 +1642,7 @@ pre:hover .copy-btn { opacity: 1; }
 <body>
 
 <div class="update-banner" id="updateBanner">
-  <span>&#10022; Update available! Run <code>pip install --upgrade claude-conversation-viewer</code></span>
+  <span>&#10022; Update available! Run <code>ccv --update</code> in your terminal to get the latest version.</span>
   <button class="dismiss-btn" onclick="dismissUpdate()" title="Dismiss">&times;</button>
 </div>
 
@@ -2634,11 +2634,19 @@ def main():
     args = parser.parse_args()
 
     if args.update:
-        import subprocess
-        print("Updating claude-conversation-viewer...")
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--upgrade", "claude-conversation-viewer"]
-        )
+        import subprocess, shutil
+        pkg = "claude-chats-and-analytics-viewer"
+        print(f"Updating {pkg}...")
+        if shutil.which("pipx"):
+            result = subprocess.run(["pipx", "upgrade", pkg])
+        elif shutil.which("uv"):
+            result = subprocess.run(["uv", "tool", "upgrade", pkg])
+        else:
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--upgrade", "--user", pkg]
+            )
+        if result.returncode == 0:
+            print("Updated! Restart with: ccv")
         sys.exit(result.returncode)
 
     if args.uninstall:
