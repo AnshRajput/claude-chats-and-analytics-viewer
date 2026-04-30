@@ -878,6 +878,7 @@ def main():
               %(prog)s --check-update           Check for available updates
         """),
     )
+    parser.add_argument("-v", "--version", action="store_true", help="Show current version and exit")
     parser.add_argument("--list", action="store_true", help="List all conversations (non-interactive)")
     parser.add_argument("--search", type=str, help="Search conversations by keyword")
     parser.add_argument("--project", type=str, help="Filter by project name")
@@ -886,6 +887,12 @@ def main():
     parser.add_argument("--limit", type=int, default=50, help="Max conversations to show in --list mode (default: 50)")
     parser.add_argument("--check-update", action="store_true", help="Check for available updates and show current vs latest version")
     args = parser.parse_args()
+
+    # -v / --version
+    if args.version:
+        from claude_conversation_viewer import __version__ as _ver
+        print(f"claude-conversation-viewer v{_ver}")
+        sys.exit(0)
 
     # --check-update: synchronous check, print result, exit
     if args.check_update:

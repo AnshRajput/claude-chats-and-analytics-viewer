@@ -704,6 +704,16 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json({"update_available": False})
 
+        elif path == "/api/settings":
+            update_info = check_for_update_sync() if check_for_update_sync is not None else {"update_available": False}
+            self._json({
+                "version": __version__,
+                "package": "claude-chats-and-analytics-viewer",
+                "projects_dir": str(get_projects_dir()),
+                "conversations_count": len(STORE.conversations),
+                "update": update_info,
+            })
+
         else:
             self._json({"error": "Not found"}, 404)
 
@@ -732,6 +742,27 @@ class Handler(BaseHTTPRequestHandler):
             save_bookmarks(bookmarks)
             STORE.bookmarks = bookmarks
             self._json({"ok": True, "bookmarked": bookmarked})
+
+        elif path == "/api/do-update":
+            import subprocess, shutil as _shutil
+            pkg = "claude-chats-and-analytics-viewer"
+            try:
+                if _shutil.which("pipx"):
+                    result = subprocess.run(["pipx", "upgrade", pkg], capture_output=True, text=True, timeout=120)
+                elif _shutil.which("uv"):
+                    result = subprocess.run(["uv", "tool", "upgrade", pkg], capture_output=True, text=True, timeout=120)
+                else:
+                    result = subprocess.run(
+                        [sys.executable, "-m", "pip", "install", "--upgrade", "--user", pkg],
+                        capture_output=True, text=True, timeout=120,
+                    )
+                if result.returncode == 0:
+                    self._json({"ok": True})
+                else:
+                    self._json({"ok": False, "error": (result.stderr or result.stdout or "Unknown error").strip()})
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)})
+
         else:
             self._json({"error": "Not found"}, 404)
 
@@ -1470,6 +1501,22 @@ pre:hover .copy-btn { opacity: 1; }
 .stats-panel { padding: 28px; overflow-y: auto; height: 100%; }
 .stats-panel h2 { font-size: 20px; font-weight: 700; margin-bottom: 22px; letter-spacing: -0.02em; }
 
+/* ── Settings panel ── */
+.settings-panel { padding: 28px; overflow-y: auto; height: 100%; max-width: 560px; }
+.settings-panel h2 { font-size: 20px; font-weight: 700; margin-bottom: 24px; letter-spacing: -0.02em; }
+.settings-section { background: var(--bg-raised); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px 20px; margin-bottom: 16px; }
+.settings-section-title { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-muted); margin-bottom: 14px; }
+.settings-row { display: flex; align-items: baseline; gap: 12px; padding: 5px 0; border-bottom: 1px solid var(--border-subtle); }
+.settings-row:last-of-type { border-bottom: none; }
+.settings-label { font-size: 12px; color: var(--text-muted); min-width: 90px; flex-shrink: 0; }
+.settings-value { font-size: 13px; color: var(--text); }
+.settings-actions { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+.settings-btn { background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text); border-radius: var(--radius-sm); padding: 6px 14px; font-size: 12px; cursor: pointer; }
+.settings-btn:hover { background: var(--bg-surface); border-color: var(--accent); }
+.settings-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.settings-btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.settings-btn-primary:hover { background: var(--accent-bright); border-color: var(--accent-bright); }
+
 .stats-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -1588,6 +1635,9 @@ pre:hover .copy-btn { opacity: 1; }
 .update-banner code { background: var(--bg-elevated); padding: 1px 7px; border-radius: 4px; font-size: 11.5px; color: var(--accent-bright); }
 .update-banner .dismiss-btn { background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 16px; padding: 0 4px; line-height: 1; flex-shrink: 0; }
 .update-banner .dismiss-btn:hover { color: var(--text); }
+.update-banner .update-now-btn { background: var(--accent); color: #fff; border: none; border-radius: 4px; padding: 3px 10px; font-size: 12px; cursor: pointer; flex-shrink: 0; }
+.update-banner .update-now-btn:hover { background: var(--accent-bright); }
+.update-banner .update-now-btn:disabled { opacity: 0.6; cursor: not-allowed; }
 
 /* ── Shortcuts hint ── */
 .shortcuts-hint {
@@ -1647,8 +1697,11 @@ pre:hover .copy-btn { opacity: 1; }
 <body>
 
 <div class="update-banner" id="updateBanner">
-  <span id="updateBannerText">&#10022; Update available! Run <code>ccv --update</code> in your terminal to get the latest version.</span>
-  <button class="dismiss-btn" onclick="dismissUpdate()" title="Dismiss">&times;</button>
+  <span id="updateBannerText">&#10022; Update available!</span>
+  <div style="display:flex;align-items:center;gap:8px;flex-shrink:0;">
+    <button class="update-now-btn" id="updateNowBtn" onclick="doUpdate()">Update Now</button>
+    <button class="dismiss-btn" onclick="dismissUpdate()" title="Dismiss">&times;</button>
+  </div>
 </div>
 
 <div class="app" id="app">
@@ -1675,6 +1728,7 @@ pre:hover .copy-btn { opacity: 1; }
         <button class="tab-btn active" data-tab="conversations" onclick="switchTab('conversations')">Conversations</button>
         <button class="tab-btn" data-tab="bookmarked" onclick="switchTab('bookmarked')">&#9733; Saved</button>
         <button class="tab-btn" data-tab="stats" onclick="switchTab('stats')">Stats</button>
+        <button class="tab-btn" data-tab="settings" onclick="switchTab('settings')">&#9881; Settings</button>
       </div>
       <div class="search-wrap" id="searchWrap">
         <span class="search-icon">&#9906;</span>
@@ -1752,6 +1806,55 @@ pre:hover .copy-btn { opacity: 1; }
     <div class="stats-panel" id="statsPanel" style="display:none">
       <div class="loading"><div class="spinner"></div> Loading stats…</div>
     </div>
+
+    <div class="settings-panel" id="settingsPanel" style="display:none">
+      <h2>Settings</h2>
+
+      <div class="settings-section">
+        <div class="settings-section-title">About</div>
+        <div class="settings-row">
+          <span class="settings-label">Version</span>
+          <span class="settings-value" id="settingsVersion">—</span>
+        </div>
+        <div class="settings-row">
+          <span class="settings-label">Package</span>
+          <span class="settings-value" id="settingsPackage" style="font-size:11px;word-break:break-all;">—</span>
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <div class="settings-section-title">Updates</div>
+        <div class="settings-row">
+          <span class="settings-label">Installed</span>
+          <span class="settings-value" id="settingsCurrent">—</span>
+        </div>
+        <div class="settings-row">
+          <span class="settings-label">Latest</span>
+          <span class="settings-value" id="settingsLatest">—</span>
+        </div>
+        <div class="settings-row">
+          <span class="settings-label">Status</span>
+          <span class="settings-value" id="settingsUpdateStatus">Checking…</span>
+        </div>
+        <div class="settings-actions">
+          <button class="settings-btn" id="settingsCheckBtn" onclick="settingsCheckUpdate()">Check for Updates</button>
+          <button class="settings-btn settings-btn-primary" id="settingsUpdateBtn" style="display:none" onclick="settingsDoUpdate()">Update Now</button>
+        </div>
+        <div id="settingsUpdateMsg" style="margin-top:8px;font-size:12px;color:var(--text-muted);display:none;"></div>
+      </div>
+
+      <div class="settings-section">
+        <div class="settings-section-title">Storage</div>
+        <div class="settings-row">
+          <span class="settings-label">Projects dir</span>
+          <span class="settings-value" id="settingsProjectsDir" style="font-size:11px;word-break:break-all;">—</span>
+        </div>
+        <div class="settings-row">
+          <span class="settings-label">Conversations</span>
+          <span class="settings-value" id="settingsConvCount">—</span>
+        </div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -1815,7 +1918,7 @@ async function checkForUpdate() {
       const verStr = (d.current_version && d.latest_version)
         ? ` v${d.current_version} → v${d.latest_version}` : '';
       document.getElementById('updateBannerText').innerHTML =
-        `&#10022; Update available!${verStr}  Run <code>ccv --update</code> to get the latest version.`;
+        `&#10022; Update available!${verStr}`;
       document.getElementById('updateBanner').classList.add('show');
     }
   } catch {}
@@ -1823,6 +1926,102 @@ async function checkForUpdate() {
 function dismissUpdate() {
   document.getElementById('updateBanner').classList.remove('show');
   sessionStorage.setItem('update-dismissed', '1');
+}
+async function doUpdate() {
+  const btn = document.getElementById('updateNowBtn');
+  const txt = document.getElementById('updateBannerText');
+  btn.disabled = true;
+  btn.textContent = 'Updating…';
+  txt.textContent = '⟳ Installing update, please wait…';
+  try {
+    const r = await fetch('/api/do-update', { method: 'POST' });
+    const d = await r.json();
+    if (d.ok) {
+      txt.innerHTML = '✓ Updated! Restart to apply: <code>ccv</code>';
+      btn.style.display = 'none';
+    } else {
+      txt.innerHTML = `✗ Update failed. Run <code>pip install --upgrade claude-chats-and-analytics-viewer</code> manually.`;
+      btn.textContent = 'Retry';
+      btn.disabled = false;
+    }
+  } catch {
+    txt.innerHTML = `✗ Update failed. Run <code>pip install --upgrade claude-chats-and-analytics-viewer</code> manually.`;
+    btn.textContent = 'Retry';
+    btn.disabled = false;
+  }
+}
+
+// ── Settings ──
+async function loadSettings() {
+  try {
+    const r = await fetch('/api/settings');
+    const d = await r.json();
+    document.getElementById('settingsVersion').textContent = 'v' + d.version;
+    document.getElementById('settingsPackage').textContent = d.package;
+    document.getElementById('settingsProjectsDir').textContent = d.projects_dir;
+    document.getElementById('settingsConvCount').textContent = d.conversations_count;
+    const u = d.update || {};
+    document.getElementById('settingsCurrent').textContent = u.current_version ? 'v' + u.current_version : '—';
+    document.getElementById('settingsLatest').textContent = u.latest_version ? 'v' + u.latest_version : '—';
+    if (u.update_available) {
+      document.getElementById('settingsUpdateStatus').innerHTML = '<span style="color:var(--accent)">Update available</span>';
+      document.getElementById('settingsUpdateBtn').style.display = 'inline-block';
+    } else {
+      document.getElementById('settingsUpdateStatus').innerHTML = '<span style="color:#4ade80">Up to date</span>';
+      document.getElementById('settingsUpdateBtn').style.display = 'none';
+    }
+  } catch {
+    document.getElementById('settingsUpdateStatus').textContent = 'Could not check';
+  }
+}
+async function settingsCheckUpdate() {
+  const btn = document.getElementById('settingsCheckBtn');
+  const statusEl = document.getElementById('settingsUpdateStatus');
+  btn.disabled = true;
+  btn.textContent = 'Checking…';
+  statusEl.textContent = 'Checking…';
+  try {
+    const r = await fetch('/api/update-check');
+    const d = await r.json();
+    document.getElementById('settingsCurrent').textContent = d.current_version ? 'v' + d.current_version : '—';
+    document.getElementById('settingsLatest').textContent = d.latest_version ? 'v' + d.latest_version : '—';
+    if (d.update_available) {
+      statusEl.innerHTML = '<span style="color:var(--accent)">Update available</span>';
+      document.getElementById('settingsUpdateBtn').style.display = 'inline-block';
+    } else {
+      statusEl.innerHTML = '<span style="color:#4ade80">Up to date</span>';
+      document.getElementById('settingsUpdateBtn').style.display = 'none';
+    }
+  } catch {
+    statusEl.textContent = 'Check failed';
+  }
+  btn.disabled = false;
+  btn.textContent = 'Check for Updates';
+}
+async function settingsDoUpdate() {
+  const btn = document.getElementById('settingsUpdateBtn');
+  const msg = document.getElementById('settingsUpdateMsg');
+  btn.disabled = true;
+  btn.textContent = 'Updating…';
+  msg.style.display = 'block';
+  msg.textContent = 'Installing update, please wait…';
+  try {
+    const r = await fetch('/api/do-update', { method: 'POST' });
+    const d = await r.json();
+    if (d.ok) {
+      msg.innerHTML = '✓ Updated! Restart to apply: <code style="background:var(--bg-elevated);padding:1px 5px;border-radius:3px;">ccv</code>';
+      btn.style.display = 'none';
+      document.getElementById('settingsUpdateStatus').innerHTML = '<span style="color:#4ade80">Updated — restart required</span>';
+    } else {
+      msg.textContent = '✗ Update failed. Run: pip install --upgrade claude-chats-and-analytics-viewer';
+      btn.disabled = false;
+      btn.textContent = 'Retry';
+    }
+  } catch {
+    msg.textContent = '✗ Update failed. Run: pip install --upgrade claude-chats-and-analytics-viewer';
+    btn.disabled = false;
+    btn.textContent = 'Retry';
+  }
 }
 
 // ── Auto-refresh polling ──
@@ -1909,6 +2108,7 @@ function switchTab(tab) {
   const header = document.getElementById('mainHeader');
   const msgs = document.getElementById('messagesContainer');
   const stats = document.getElementById('statsPanel');
+  const settings = document.getElementById('settingsPanel');
   const searchWrap = document.getElementById('searchWrap');
   const filterRow = document.querySelector('.filter-row');
 
@@ -1916,11 +2116,19 @@ function switchTab(tab) {
     header.style.display = 'none';
     msgs.style.display = 'none';
     stats.style.display = 'block';
+    settings.style.display = 'none';
     loadStats();
+  } else if (tab === 'settings') {
+    header.style.display = 'none';
+    msgs.style.display = 'none';
+    stats.style.display = 'none';
+    settings.style.display = 'block';
+    loadSettings();
   } else {
     header.style.display = 'block';
     msgs.style.display = 'block';
     stats.style.display = 'none';
+    settings.style.display = 'none';
     if (!currentConvId) document.getElementById('sessionBar').style.display = 'none';
   }
 
