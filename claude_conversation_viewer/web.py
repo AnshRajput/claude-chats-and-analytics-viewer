@@ -26,6 +26,11 @@ try:
 except ImportError:
     check_for_update_sync = None
 
+try:
+    from claude_conversation_viewer import __version__
+except ImportError:
+    __version__ = "unknown"
+
 # ---------------------------------------------------------------------------
 # Model pricing table  (input $/1M, output $/1M, cache_write $/1M, cache_read $/1M)
 # ---------------------------------------------------------------------------
