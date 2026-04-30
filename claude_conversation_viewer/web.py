@@ -1735,6 +1735,12 @@ pre:hover .copy-btn { opacity: 1; }
         <div class="empty-icon">&#9670;</div>
         <div class="empty-title">No conversation selected</div>
         <div class="empty-hint">Use <kbd style="background:var(--bg-elevated);border:1px solid var(--border);border-radius:3px;padding:1px 5px;font-size:11px;">/</kbd> to search or click any conversation</div>
+        <div style="margin-top:20px;padding:12px 18px;background:var(--bg-surface);border:1px solid var(--border);border-radius:var(--radius);font-size:12px;color:var(--text-muted);line-height:1.8;text-align:left;max-width:320px;">
+          <div style="font-weight:600;color:var(--text);margin-bottom:6px;">How to restart</div>
+          <div>Browser tab closed? <span style="color:var(--accent-bright)">Just reopen this tab</span> or visit <code style="background:var(--bg-elevated);padding:1px 5px;border-radius:3px;font-size:11px;color:var(--accent-bright)">http://127.0.0.1:5005</code></div>
+          <div style="margin-top:4px;">Server stopped? Run <code style="background:var(--bg-elevated);padding:1px 5px;border-radius:3px;font-size:11px;color:var(--accent-bright)">ccv</code> in your terminal to restart.</div>
+          <div style="margin-top:4px;">Auto-start on login: <code style="background:var(--bg-elevated);padding:1px 5px;border-radius:3px;font-size:11px;color:var(--accent-bright)">ccv --install</code></div>
+        </div>
       </div>
     </div>
 
@@ -2662,12 +2668,15 @@ def main():
         server = HTTPServer(("127.0.0.1", port), Handler)
     url = f"http://127.0.0.1:{port}"
 
-    print(f"\n  Claude Code Conversation Viewer  v2.0")
+    print(f"\n  Claude Code Conversation Viewer  v{__version__}")
     print(f"  ═══════════════════════════════════════")
     print(f"  {len(STORE.conversations)} conversations · {len(STORE.projects)} projects")
     print(f"  Running at: {url}")
-    print(f"  Press Ctrl+C to stop")
-    print(f"  Tip: --install (macOS) or --install-systemd (Linux) to auto-start\n")
+    print()
+    print(f"  Browser closed?  Visit {url} to reopen")
+    print(f"  Server stopped?  Run 'ccv' to restart")
+    print(f"  Stop server:     Press Ctrl+C")
+    print(f"  Tip: 'ccv --install' (macOS) or 'ccv --install-systemd' (Linux) to auto-start\n")
 
     if not args.no_open:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
