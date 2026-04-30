@@ -1,0 +1,5 @@
+[console_scripts]
+claude-conversations = claude_conversation_viewer.web:main
+claude-conversations-cli = claude_conversation_viewer.cli:main
+claude-dashboard = claude_conversation_viewer.web:main
+
