@@ -21,3 +21,4 @@ Thumbs.db
 # Secrets / temp
 .pypirc
 /tmp/.pypirc
+.playwright-mcp/

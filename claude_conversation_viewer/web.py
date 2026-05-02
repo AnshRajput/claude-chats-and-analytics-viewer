@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Claude Code Conversation Viewer - Web UI with full feature set."""
+"""Claude Code Conversation Viewer - Web UI.
+
+Thin orchestration layer. The heavy lifting lives in sibling modules:
+
+* ``pricing``   — model pricing table + cost estimation
+* ``classifier`` — 13-category deterministic task classifier
+* ``parser``    — JSONL parsing (metadata, per-turn data, full messages)
+* ``cache``     — mtime-keyed metadata cache + bookmarks + plans
+* ``store``     — :class:`ConversationStore`, the in-memory session index
+* ``dashboard`` — aggregator + optimize + compare + yield + plans + export
+"""
 
 from __future__ import annotations
 
@@ -8,17 +18,14 @@ import io
 import json
 import os
 import platform
-import re
 import sys
-import tempfile
 import threading
 import time
 import webbrowser
 import zipfile
-from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from urllib.parse import urlparse, parse_qs
 
 try:
@@ -31,533 +38,40 @@ try:
 except ImportError:
     __version__ = "unknown"
 
-# ---------------------------------------------------------------------------
-# Model pricing table  (input $/1M, output $/1M, cache_write $/1M, cache_read $/1M)
-# ---------------------------------------------------------------------------
-
-MODEL_PRICING: Dict[str, Tuple[float, float, float, float]] = {
-    "claude-opus-4":     (15.00, 75.00, 18.75, 1.50),
-    "claude-sonnet-4":   (3.00,  15.00, 3.75,  0.30),
-    "claude-haiku-4":    (0.80,  4.00,  1.00,  0.08),
-    "claude-3-7-sonnet": (3.00,  15.00, 3.75,  0.30),
-    "claude-3-5-sonnet": (3.00,  15.00, 3.75,  0.30),
-    "claude-3-5-haiku":  (0.80,  4.00,  1.00,  0.08),
-    "claude-3-opus":     (15.00, 75.00, 18.75, 1.50),
-    "claude-3-sonnet":   (3.00,  15.00, 3.75,  0.30),
-    "claude-3-haiku":    (0.25,  1.25,  0.30,  0.03),
-}
-
-CACHE_VERSION = 2
-
-# ---------------------------------------------------------------------------
-# Path helpers
-# ---------------------------------------------------------------------------
-
-def get_claude_dir() -> Path:
-    if platform.system() == "Windows":
-        base = Path(os.environ.get("USERPROFILE", Path.home()))
-    else:
-        base = Path.home()
-    return base / ".claude"
-
-
-def get_projects_dir() -> Path:
-    return get_claude_dir() / "projects"
-
-
-def get_cache_path() -> Path:
-    return Path(tempfile.gettempdir()) / "claude-viewer-cache-v2.json"
-
-
-def get_bookmarks_path() -> Path:
-    return get_claude_dir() / "viewer-bookmarks.json"
+# ── Module re-exports (tests import these from here) ─────────────────────────
+from .pricing import MODEL_PRICING, get_model_pricing, estimate_cost, clean_model_name  # noqa: F401
+from .cache import (
+    CACHE_VERSION,
+    get_claude_dir,
+    get_projects_dir,
+    get_cache_path,
+    get_bookmarks_path,
+    get_plan_path,
+    load_bookmarks,
+    save_bookmarks,
+    load_metadata_cache,
+    save_metadata_cache,
+    load_plan,
+    save_plan,
+)
+from .parser import (
+    parse_conversation_metadata,
+    parse_conversation_for_dashboard,
+    parse_full_conversation,
+    export_as_markdown,
+)
+from .store import ConversationStore
+from .dashboard.aggregator import build_dashboard
+from .dashboard.optimize import build_optimize
+from .dashboard.compare import build_compare
+from .dashboard.yield_tracker import build_yield
+from .dashboard.plans import normalize_plan, list_presets
+from .dashboard.export import export_dashboard
 
 
 def decode_project_slug(slug: str) -> str:
     return slug
 
-# ---------------------------------------------------------------------------
-# Cost estimation
-# ---------------------------------------------------------------------------
-
-def get_model_pricing(model_name: str) -> Tuple[float, float, float, float]:
-    if not model_name:
-        return (3.00, 15.00, 3.75, 0.30)
-    lower = model_name.lower()
-    for pattern, pricing in MODEL_PRICING.items():
-        if pattern in lower:
-            return pricing
-    return (3.00, 15.00, 3.75, 0.30)
-
-
-def estimate_cost(conv: dict) -> float:
-    models = conv.get("models", [])
-    pricing = get_model_pricing(models[0] if models else "")
-    cost = (
-        conv.get("total_input_tokens", 0) / 1_000_000 * pricing[0]
-        + conv.get("total_output_tokens", 0) / 1_000_000 * pricing[1]
-        + conv.get("total_cache_creation", 0) / 1_000_000 * pricing[2]
-        + conv.get("total_cache_read", 0) / 1_000_000 * pricing[3]
-    )
-    return round(cost, 4)
-
-# ---------------------------------------------------------------------------
-# Smart metadata cache
-# ---------------------------------------------------------------------------
-
-def load_metadata_cache() -> dict:
-    try:
-        p = get_cache_path()
-        if p.exists():
-            data = json.loads(p.read_text(encoding="utf-8"))
-            if data.get("version") == CACHE_VERSION:
-                return data.get("entries", {})
-    except Exception:
-        pass
-    return {}
-
-
-def save_metadata_cache(entries: dict):
-    try:
-        get_cache_path().write_text(
-            json.dumps({"version": CACHE_VERSION, "entries": entries}),
-            encoding="utf-8",
-        )
-    except Exception:
-        pass
-
-# ---------------------------------------------------------------------------
-# Bookmarks
-# ---------------------------------------------------------------------------
-
-def load_bookmarks() -> dict:
-    try:
-        p = get_bookmarks_path()
-        if p.exists():
-            data = json.loads(p.read_text(encoding="utf-8"))
-            return data.get("bookmarks", {})
-    except Exception:
-        pass
-    return {}
-
-
-def save_bookmarks(bookmarks: dict):
-    try:
-        p = get_bookmarks_path()
-        p.write_text(
-            json.dumps({"version": 1, "bookmarks": bookmarks}, indent=2),
-            encoding="utf-8",
-        )
-    except Exception:
-        pass
-
-# ---------------------------------------------------------------------------
-# JSONL parser
-# ---------------------------------------------------------------------------
-
-def parse_conversation_metadata(filepath: Path) -> Optional[dict]:
-    session_id = filepath.stem
-    project_slug = filepath.parent.name
-    title = None
-    preview = None
-    first_timestamp = None
-    last_timestamp = None
-    models: set = set()
-    total_input = total_output = total_cache_create = total_cache_read = 0
-    user_count = assistant_count = 0
-    cwd = None
-    version = None
-
-    try:
-        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                msg = obj.get("message", {})
-                role = msg.get("role")
-                ts = obj.get("timestamp")
-
-                if ts:
-                    if first_timestamp is None:
-                        first_timestamp = ts
-                    last_timestamp = ts
-
-                if role == "user" and obj.get("type") == "user":
-                    content = msg.get("content", "")
-                    if isinstance(content, str) and content and not content.startswith("<"):
-                        user_count += 1
-                        if title is None:
-                            title = content[:80]
-                            preview = content[:220]
-                        if cwd is None:
-                            cwd = obj.get("cwd")
-                        if version is None:
-                            version = obj.get("version")
-                    elif isinstance(content, list):
-                        user_count += 1
-                        if title is None:
-                            for block in content:
-                                if isinstance(block, dict) and block.get("type") == "text":
-                                    text = block.get("text", "")
-                                    if text and not text.startswith("<"):
-                                        title = text[:80]
-                                        preview = text[:220]
-                                        break
-
-                elif role == "assistant":
-                    assistant_count += 1
-                    model = msg.get("model")
-                    if model:
-                        models.add(model)
-                    usage = msg.get("usage", {})
-                    total_input += usage.get("input_tokens", 0)
-                    total_output += usage.get("output_tokens", 0)
-                    total_cache_create += usage.get("cache_creation_input_tokens", 0)
-                    total_cache_read += usage.get("cache_read_input_tokens", 0)
-
-    except (OSError, PermissionError):
-        return None
-
-    if user_count == 0 and assistant_count == 0:
-        return None
-
-    meta = {
-        "id": session_id,
-        "project": project_slug,
-        "project_path": cwd or decode_project_slug(project_slug),
-        "title": title or "(untitled)",
-        "preview": preview or title or "(untitled)",
-        "first_timestamp": first_timestamp,
-        "last_timestamp": last_timestamp,
-        "models": sorted(models),
-        "total_input_tokens": total_input,
-        "total_output_tokens": total_output,
-        "total_cache_creation": total_cache_create,
-        "total_cache_read": total_cache_read,
-        "user_messages": user_count,
-        "assistant_messages": assistant_count,
-        "total_messages": user_count + assistant_count,
-        "cwd": cwd,
-        "version": version,
-        "file_path": str(filepath),
-    }
-    meta["estimated_cost_usd"] = estimate_cost(meta)
-    return meta
-
-
-def parse_full_conversation(filepath: Path) -> list:
-    messages = []
-    try:
-        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                msg = obj.get("message", {})
-                role = msg.get("role")
-
-                if role not in ("user", "assistant"):
-                    continue
-                if role == "user" and obj.get("isMeta"):
-                    continue
-
-                content = msg.get("content", "")
-                if isinstance(content, str) and content.strip().startswith(("<command-name>", "<local-command")):
-                    continue
-
-                entry: dict = {
-                    "role": role,
-                    "timestamp": obj.get("timestamp"),
-                    "uuid": obj.get("uuid"),
-                }
-
-                if role == "assistant":
-                    entry["model"] = msg.get("model")
-                    usage = msg.get("usage", {})
-                    entry["usage"] = {
-                        "input_tokens": usage.get("input_tokens", 0),
-                        "output_tokens": usage.get("output_tokens", 0),
-                        "cache_creation": usage.get("cache_creation_input_tokens", 0),
-                        "cache_read": usage.get("cache_read_input_tokens", 0),
-                    }
-                    pricing = get_model_pricing(entry.get("model") or "")
-                    u = entry["usage"]
-                    entry["estimated_cost_usd"] = round(
-                        u["input_tokens"] / 1e6 * pricing[0]
-                        + u["output_tokens"] / 1e6 * pricing[1]
-                        + u["cache_creation"] / 1e6 * pricing[2]
-                        + u["cache_read"] / 1e6 * pricing[3],
-                        6,
-                    )
-
-                if isinstance(content, str):
-                    if content and not content.startswith("<"):
-                        entry["content"] = [{"type": "text", "text": content}]
-                    else:
-                        continue
-                elif isinstance(content, list):
-                    blocks = []
-                    for block in content:
-                        if not isinstance(block, dict):
-                            if isinstance(block, str) and block and not block.startswith("<"):
-                                blocks.append({"type": "text", "text": block})
-                            continue
-                        btype = block.get("type")
-                        if btype == "text":
-                            text = block.get("text", "")
-                            if text and not text.startswith("<system-reminder>"):
-                                blocks.append({"type": "text", "text": text})
-                        elif btype == "tool_use":
-                            blocks.append({
-                                "type": "tool_use",
-                                "name": block.get("name", "unknown"),
-                                "id": block.get("id", ""),
-                                "input": block.get("input", {}),
-                            })
-                        elif btype == "tool_result":
-                            rc = block.get("content", "")
-                            if isinstance(rc, list):
-                                rc = "\n".join(
-                                    x.get("text", "") for x in rc
-                                    if isinstance(x, dict) and x.get("type") == "text"
-                                )
-                            blocks.append({
-                                "type": "tool_result",
-                                "tool_use_id": block.get("tool_use_id", ""),
-                                "content": str(rc)[:5000],
-                            })
-                        elif btype == "thinking":
-                            thinking_text = block.get("thinking", "")
-                            if thinking_text:
-                                blocks.append({"type": "thinking", "text": thinking_text})
-                    if blocks:
-                        entry["content"] = blocks
-                    else:
-                        continue
-                else:
-                    continue
-
-                messages.append(entry)
-
-    except (OSError, PermissionError):
-        pass
-
-    return messages
-
-
-def export_as_markdown(filepath: Path, metadata: dict) -> str:
-    messages = parse_full_conversation(filepath)
-    lines = [
-        f"# {metadata.get('title', 'Conversation')}",
-        "",
-        f"**Session ID:** {metadata['id']}",
-        f"**Project:** {metadata['project_path']}",
-        f"**Date:** {metadata.get('first_timestamp', 'Unknown')}",
-    ]
-    if metadata.get("models"):
-        lines.append(f"**Model(s):** {', '.join(metadata['models'])}")
-    lines += [f"**Messages:** {metadata['total_messages']}", "", "---", ""]
-
-    for msg in messages:
-        role_label = "**User**" if msg["role"] == "user" else "**Assistant**"
-        ts = msg.get("timestamp", "")
-        lines.append(f"### {role_label} {('(' + ts + ')') if ts else ''}")
-        lines.append("")
-        for block in msg.get("content", []):
-            btype = block.get("type")
-            if btype == "text":
-                lines.append(block["text"])
-            elif btype == "tool_use":
-                lines += [
-                    f"<details><summary>Tool: {block['name']}</summary>",
-                    "",
-                    "```json",
-                    json.dumps(block.get("input", {}), indent=2)[:3000],
-                    "```",
-                    "</details>",
-                ]
-            elif btype == "tool_result":
-                lines += [
-                    "<details><summary>Tool Result</summary>",
-                    "",
-                    "```",
-                    str(block.get("content", ""))[:3000],
-                    "```",
-                    "</details>",
-                ]
-            lines.append("")
-        lines += ["---", ""]
-
-    return "\n".join(lines)
-
-# ---------------------------------------------------------------------------
-# Data store
-# ---------------------------------------------------------------------------
-
-class ConversationStore:
-    def __init__(self):
-        self.conversations: List[dict] = []
-        self.by_id: Dict[str, dict] = {}
-        self.projects: List[str] = []
-        self._file_map: Dict[str, Path] = {}
-        self.bookmarks: Dict[str, bool] = {}
-        self.last_scanned: float = 0
-
-    def load(self):
-        projects_dir = get_projects_dir()
-        if not projects_dir.exists():
-            print(f"[WARN] Claude projects directory not found: {projects_dir}")
-            self.last_scanned = time.time()
-            return
-
-        cache = load_metadata_cache()
-        new_cache: dict = {}
-        parsed = 0
-        cache_hits = 0
-
-        all_files: List[Path] = []
-        for project_dir in sorted(projects_dir.iterdir()):
-            if not project_dir.is_dir() or project_dir.name.startswith("."):
-                continue
-            all_files.extend(sorted(project_dir.glob("*.jsonl")))
-
-        conversations: List[dict] = []
-        file_map: Dict[str, Path] = {}
-
-        for jsonl_file in all_files:
-            file_key = str(jsonl_file)
-            try:
-                stat = jsonl_file.stat()
-                mtime = stat.st_mtime
-                size = stat.st_size
-            except OSError:
-                continue
-
-            cached = cache.get(file_key)
-            if cached and cached.get("mtime") == mtime and cached.get("size") == size:
-                meta = cached["metadata"]
-                cache_hits += 1
-            else:
-                meta = parse_conversation_metadata(jsonl_file)
-                parsed += 1
-
-            if meta:
-                new_cache[file_key] = {"mtime": mtime, "size": size, "metadata": meta}
-                conversations.append(meta)
-                file_map[meta["id"]] = jsonl_file
-
-        conversations.sort(key=lambda c: c.get("last_timestamp") or "", reverse=True)
-
-        self.conversations = conversations
-        self.by_id = {c["id"]: c for c in conversations}
-        self._file_map = file_map
-        self.projects = sorted(set(c["project"] for c in conversations))
-        self.bookmarks = load_bookmarks()
-        self.last_scanned = time.time()
-
-        save_metadata_cache(new_cache)
-        total = len(conversations)
-        print(
-            f"[INFO] {total} conversations ({cache_hits} cached, {parsed} parsed) "
-            f"from {len(self.projects)} projects"
-        )
-
-    def get_stats(self) -> dict:
-        total_input = sum(c["total_input_tokens"] for c in self.conversations)
-        total_output = sum(c["total_output_tokens"] for c in self.conversations)
-        total_cache_create = sum(c["total_cache_creation"] for c in self.conversations)
-        total_cache_read = sum(c["total_cache_read"] for c in self.conversations)
-        total_messages = sum(c["total_messages"] for c in self.conversations)
-        total_cost = sum(c.get("estimated_cost_usd", 0) for c in self.conversations)
-
-        model_counts: Dict[str, int] = {}
-        for c in self.conversations:
-            for m in c["models"]:
-                model_counts[m] = model_counts.get(m, 0) + 1
-
-        project_counts: Dict[str, int] = {}
-        for c in self.conversations:
-            p = c["project_path"]
-            project_counts[p] = project_counts.get(p, 0) + 1
-
-        daily_activity: Dict[str, int] = {}
-        for c in self.conversations:
-            ts = c.get("first_timestamp")
-            if ts and len(ts) >= 10:
-                day = ts[:10]
-                daily_activity[day] = daily_activity.get(day, 0) + 1
-
-        return {
-            "total_conversations": len(self.conversations),
-            "total_projects": len(self.projects),
-            "total_messages": total_messages,
-            "total_input_tokens": total_input,
-            "total_output_tokens": total_output,
-            "total_cache_creation_tokens": total_cache_create,
-            "total_cache_read_tokens": total_cache_read,
-            "total_tokens": total_input + total_output + total_cache_create + total_cache_read,
-            "total_cost_usd": round(total_cost, 4),
-            "model_usage": dict(sorted(model_counts.items(), key=lambda x: -x[1])),
-            "project_counts": dict(sorted(project_counts.items(), key=lambda x: -x[1])),
-            "daily_activity": daily_activity,
-        }
-
-    def search_content(self, query: str) -> List[dict]:
-        results = []
-        query_lower = query.lower()
-        for conv in self.conversations:
-            filepath = self._file_map.get(conv["id"])
-            if not filepath:
-                continue
-            try:
-                with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-                    for line in f:
-                        try:
-                            obj = json.loads(line.strip())
-                            msg = obj.get("message", {})
-                            content = msg.get("content", "")
-                            if isinstance(content, str):
-                                text = content
-                            elif isinstance(content, list):
-                                text = " ".join(
-                                    b.get("text", "") for b in content
-                                    if isinstance(b, dict) and b.get("type") == "text"
-                                )
-                            else:
-                                continue
-
-                            if query_lower in text.lower():
-                                idx = text.lower().find(query_lower)
-                                start = max(0, idx - 60)
-                                end = min(len(text), idx + len(query) + 100)
-                                prefix = "…" if start > 0 else ""
-                                suffix = "…" if end < len(text) else ""
-                                snippet = prefix + text[start:end] + suffix
-                                results.append({
-                                    "id": conv["id"],
-                                    "title": conv["title"],
-                                    "project_path": conv.get("project_path", ""),
-                                    "first_timestamp": conv.get("first_timestamp"),
-                                    "snippet": snippet[:300],
-                                    "bookmarked": conv["id"] in self.bookmarks,
-                                })
-                                break
-                        except (json.JSONDecodeError, AttributeError):
-                            continue
-            except (OSError, PermissionError):
-                pass
-        return results
 
 
 STORE = ConversationStore()
@@ -657,7 +171,70 @@ class Handler(BaseHTTPRequestHandler):
             self._download(zip_bytes, f"claude-conversations.zip", "application/zip")
 
         elif path == "/api/stats":
+            # Legacy endpoint — kept for backward compatibility
             self._json(STORE.get_stats())
+
+        elif path == "/api/dashboard":
+            period = params.get("period", ["7d"])[0]
+            from_str = params.get("from", [None])[0]
+            to_str = params.get("to", [None])[0]
+            plan = load_plan()
+            payload = build_dashboard(
+                STORE.conversations, STORE.dashboard_data,
+                period=period, from_str=from_str, to_str=to_str, plan=plan,
+            )
+            self._json(payload)
+
+        elif path == "/api/dashboard/optimize":
+            period = params.get("period", ["30d"])[0]
+            from_str = params.get("from", [None])[0]
+            to_str = params.get("to", [None])[0]
+            self._json(build_optimize(
+                STORE.conversations, STORE.dashboard_data,
+                period=period, from_str=from_str, to_str=to_str,
+            ))
+
+        elif path == "/api/dashboard/compare":
+            period = params.get("period", ["30d"])[0]
+            from_str = params.get("from", [None])[0]
+            to_str = params.get("to", [None])[0]
+            models = params.get("models", [""])[0]
+            models_list = [m.strip() for m in models.split(",") if m.strip()] or None
+            self._json(build_compare(
+                STORE.conversations, STORE.dashboard_data,
+                period=period, from_str=from_str, to_str=to_str,
+                models_filter=models_list,
+            ))
+
+        elif path == "/api/dashboard/yield":
+            period = params.get("period", ["7d"])[0]
+            from_str = params.get("from", [None])[0]
+            to_str = params.get("to", [None])[0]
+            proj = params.get("project", [None])[0]
+            self._json(build_yield(
+                STORE.conversations, STORE.dashboard_data,
+                period=period, from_str=from_str, to_str=to_str,
+                project_filter=proj,
+            ))
+
+        elif path == "/api/dashboard/plan":
+            plan = load_plan()
+            self._json({"plan": plan, "presets": list_presets()})
+
+        elif path == "/api/dashboard/export":
+            period = params.get("period", ["30d"])[0]
+            from_str = params.get("from", [None])[0]
+            to_str = params.get("to", [None])[0]
+            fmt = params.get("format", ["json"])[0]
+            try:
+                filename, body, ctype = export_dashboard(
+                    STORE.conversations, STORE.dashboard_data,
+                    fmt=fmt, period=period, from_str=from_str, to_str=to_str,
+                )
+            except ValueError as e:
+                self._json({"error": str(e)}, 400)
+                return
+            self._download(body, filename, ctype)
 
         elif path == "/api/search":
             query = params.get("q", [""])[0].strip()
@@ -743,6 +320,13 @@ class Handler(BaseHTTPRequestHandler):
             STORE.bookmarks = bookmarks
             self._json({"ok": True, "bookmarked": bookmarked})
 
+        elif path == "/api/dashboard/plan":
+            preset = data.get("preset", "none")
+            monthly = float(data.get("monthly_usd", 0.0) or 0.0)
+            plan = normalize_plan(preset, monthly)
+            save_plan(plan)
+            self._json({"ok": True, "plan": plan})
+
         elif path == "/api/do-update":
             import subprocess, shutil as _shutil
             pkg = "claude-chats-and-analytics-viewer"
@@ -782,8 +366,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Claude Conversations</title>
+<title>Ledger — Claude Code accounts</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@300;400;500;600;700&family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500;600&display=swap">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.1/marked.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
@@ -791,64 +377,109 @@ HTML_PAGE = r"""<!DOCTYPE html>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
-  --bg:            #080b10;
-  --bg-surface:    #0f1318;
-  --bg-raised:     #161b24;
-  --bg-elevated:   #1c2333;
-  --border:        #21262e;
-  --border-subtle: #181c24;
-  --text:          #e2e8f0;
-  --text-muted:    #64748b;
-  --text-faint:    #374151;
-  --accent:        #8b5cf6;
-  --accent-bright: #a78bfa;
-  --accent-dim:    rgba(139, 92, 246, 0.12);
-  --accent-glow:   rgba(139, 92, 246, 0.06);
-  --indigo:        #6366f1;
-  --indigo-dim:    rgba(99, 102, 241, 0.12);
-  --green:         #22c55e;
-  --green-dim:     rgba(34, 197, 94, 0.1);
-  --yellow:        #eab308;
-  --yellow-dim:    rgba(234, 179, 8, 0.1);
-  --red:           #ef4444;
-  --cyan:          #22d3ee;
-  --user-bg:          rgba(56, 139, 253, 0.07);
-  --user-border:      rgba(56, 139, 253, 0.22);
-  --user-accent:      #3b82f6;
-  --asst-bg:          rgba(139, 92, 246, 0.07);
-  --asst-border:      rgba(139, 92, 246, 0.22);
-  --asst-accent:      #8b5cf6;
-  --thinking-bg:      rgba(245, 158, 11, 0.06);
-  --thinking-border:  rgba(245, 158, 11, 0.25);
-  --thinking-accent:  #f59e0b;
-  --thinking-dim:     rgba(245, 158, 11, 0.12);
-  --radius:        10px;
-  --radius-sm:     6px;
-  --radius-xs:     4px;
-  --shadow:        0 4px 24px rgba(0,0,0,0.4);
-  --shadow-sm:     0 2px 8px rgba(0,0,0,0.3);
+  /* Neutrals — warm-tinted true-dark (not pure #000, not navy). */
+  --bg:            oklch(0.09 0.006 40);       /* page */
+  --bg-surface:    oklch(0.12 0.005 40);       /* sidebar */
+  --bg-raised:     oklch(0.15 0.004 40);       /* cards */
+  --bg-elevated:   oklch(0.19 0.004 40);       /* hover/active */
+  --border:        oklch(0.24 0.004 40);
+  --border-subtle: oklch(0.18 0.004 40);
+
+  /* Text — warm off-white, never pure white. */
+  --text:          oklch(0.97 0.006 75);
+  --text-muted:    oklch(0.64 0.008 55);
+  --text-faint:    oklch(0.42 0.006 45);
+
+  /* Single accent: electric chartreuse. Used <10% of surface (Restrained). */
+  --accent:        oklch(0.90 0.19 110);
+  --accent-ink:    oklch(0.18 0.03 110);       /* text on accent bg */
+  --accent-soft:   oklch(0.90 0.19 110 / 0.10);
+
+  /* Functional */
+  --positive:      oklch(0.78 0.16 145);
+  --positive-soft: oklch(0.78 0.16 145 / 0.12);
+  --negative:      oklch(0.70 0.18 28);
+  --negative-soft: oklch(0.70 0.18 28 / 0.12);
+  --warning:       oklch(0.82 0.14 75);
+  --warning-soft:  oklch(0.82 0.14 75 / 0.12);
+  --info:          oklch(0.78 0.10 225);
+  --info-soft:     oklch(0.78 0.10 225 / 0.12);
+
+  /* Message accents (kept compatible with existing viewer styling). */
+  --user-accent:      oklch(0.75 0.15 235);
+  --user-bg:          oklch(0.75 0.15 235 / 0.08);
+  --user-border:      oklch(0.75 0.15 235 / 0.22);
+  --asst-accent:      oklch(0.88 0.12 100);
+  --asst-bg:          oklch(0.88 0.12 100 / 0.07);
+  --asst-border:      oklch(0.88 0.12 100 / 0.20);
+  --thinking-accent:  oklch(0.78 0.14 70);
+  --thinking-bg:      oklch(0.78 0.14 70 / 0.06);
+  --thinking-border:  oklch(0.78 0.14 70 / 0.22);
+  --thinking-dim:     oklch(0.78 0.14 70 / 0.10);
+
+  /* Backwards-compat aliases — preserve existing component CSS that used
+     these names. New code should prefer the semantic tokens above. */
+  --accent-bright: var(--accent);
+  --accent-dim:    var(--accent-soft);
+  --accent-glow:   oklch(0.90 0.19 110 / 0.05);
+  --indigo:        var(--info);
+  --indigo-dim:    var(--info-soft);
+  --green:         var(--positive);
+  --green-dim:     var(--positive-soft);
+  --yellow:        var(--warning);
+  --yellow-dim:    var(--warning-soft);
+  --red:           var(--negative);
+  --cyan:          var(--info);
+
+  /* Geometry */
+  --radius:        2px;
+  --radius-sm:     2px;
+  --radius-xs:     2px;
+  --radius-pill:   999px;
+  --ease-quint:    cubic-bezier(0.16, 1, 0.3, 1);
+
+  /* Shadows — physical, warm-tinted. */
+  --shadow:        0 1px 0 oklch(1 0 0 / 0.02) inset, 0 20px 40px -24px oklch(0 0 0 / 0.6);
+  --shadow-sm:     0 1px 0 oklch(1 0 0 / 0.02) inset;
+
+  /* Type — single clean sans for everything; scale + weight carry hierarchy. */
+  --font-ui:      'Inter Tight', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-display: 'Inter Tight', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono:    'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
 }
 
+html { background: var(--bg); }
+
 body {
-  font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif;
+  font-family: var(--font-ui);
   background: var(--bg);
   color: var(--text);
   height: 100vh;
   overflow: hidden;
-  font-size: 14px;
+  font-size: 13.5px;
   line-height: 1.5;
+  letter-spacing: -0.005em;
+  font-feature-settings: 'cv11', 'ss01', 'ss03', 'zero';
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
 }
+
+/* Selection: accent + ink. */
+::selection { background: var(--accent); color: var(--accent-ink); }
+
+/* Numeric text should always be tabular for dashboards. */
+.tabular, [data-numeric] { font-variant-numeric: tabular-nums; }
 
 /* ── Layout ── */
 .app { display: flex; height: 100vh; }
 
 /* ── Sidebar ── */
 .sidebar {
-  width: 340px;
-  min-width: 340px;
+  width: 320px;
+  min-width: 320px;
   background: var(--bg-surface);
-  border-right: 1px solid var(--border);
+  border-right: 1px solid var(--border-subtle);
   display: flex;
   flex-direction: column;
   height: 100vh;
@@ -856,41 +487,54 @@ body {
 }
 
 .sidebar-header {
-  padding: 14px 14px 10px;
+  padding: 22px 20px 12px;
   border-bottom: 1px solid var(--border-subtle);
   flex-shrink: 0;
 }
 
 .brand {
   display: flex;
-  align-items: center;
-  gap: 9px;
-  margin-bottom: 12px;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 24px;
+  flex-wrap: wrap;
 }
 
+/* Wordmark: bold sans, with a chartreuse period. */
 .brand-icon {
-  width: 30px;
-  height: 30px;
-  background: linear-gradient(135deg, var(--accent) 0%, #c084fc 100%);
-  border-radius: 8px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 14px;
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 22px;
+  line-height: 1;
+  color: var(--text);
+  letter-spacing: -0.03em;
   flex-shrink: 0;
-  box-shadow: 0 2px 8px rgba(139,92,246,0.35);
+}
+.brand-icon::after {
+  content: ".";
+  color: var(--accent);
+  margin-left: 1px;
 }
 
-.brand-text { font-size: 14px; font-weight: 600; letter-spacing: -0.01em; }
-.brand-sub { font-size: 11px; color: var(--text-muted); font-weight: 400; }
+.brand-text {
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  align-self: flex-end;
+  padding-bottom: 3px;
+}
+.brand-sub { display: none; }
 
-.brand-actions { margin-left: auto; display: flex; gap: 6px; }
+.brand-actions { margin-left: auto; display: flex; gap: 2px; }
 
 .icon-btn {
   width: 28px;
   height: 28px;
-  border: 1px solid var(--border);
-  background: var(--bg-raised);
+  border: 1px solid transparent;
+  background: transparent;
   color: var(--text-muted);
   border-radius: var(--radius-sm);
   cursor: pointer;
@@ -898,128 +542,166 @@ body {
   align-items: center;
   justify-content: center;
   font-size: 13px;
-  transition: all 0.15s;
+  transition: color 140ms var(--ease-quint), background 140ms var(--ease-quint), border-color 140ms var(--ease-quint);
   flex-shrink: 0;
 }
-.icon-btn:hover { background: var(--bg-elevated); color: var(--text); border-color: var(--accent); }
-.icon-btn.active { background: var(--accent-dim); color: var(--accent-bright); border-color: var(--accent); }
+.icon-btn:hover { color: var(--text); background: var(--bg-raised); border-color: var(--border-subtle); }
+.icon-btn.active { color: var(--accent-ink); background: var(--accent); border-color: var(--accent); }
 
+/* Tabs: text links with an underline for the active tab — no pill bar. */
 .tabs {
   display: flex;
-  gap: 3px;
-  background: var(--bg-raised);
-  padding: 3px;
-  border-radius: var(--radius-sm);
-  margin-bottom: 10px;
+  gap: 20px;
+  margin-bottom: 16px;
+  border-bottom: 1px solid var(--border-subtle);
+  margin-left: -20px;
+  margin-right: -20px;
+  padding: 0 20px;
+  overflow-x: auto;
+  scrollbar-width: none;
 }
+.tabs::-webkit-scrollbar { display: none; }
 
 .tab-btn {
-  flex: 1;
-  padding: 5px 8px;
+  padding: 10px 0 12px;
   border: none;
   background: transparent;
-  color: var(--text-muted);
-  border-radius: 5px;
+  color: var(--text-faint);
   cursor: pointer;
-  font-size: 12px;
+  font-size: 12.5px;
   font-weight: 500;
-  transition: all 0.15s;
+  font-family: var(--font-ui);
+  letter-spacing: -0.005em;
   white-space: nowrap;
+  position: relative;
+  transition: color 140ms var(--ease-quint);
 }
-.tab-btn.active { background: var(--bg-elevated); color: var(--text); box-shadow: var(--shadow-sm); }
-.tab-btn:hover:not(.active) { color: var(--text); }
+.tab-btn::after {
+  content: "";
+  position: absolute;
+  left: 0; right: 0; bottom: -1px;
+  height: 1px;
+  background: var(--text);
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 240ms var(--ease-quint);
+}
+.tab-btn.active { color: var(--text); }
+.tab-btn.active::after { transform: scaleX(1); }
+.tab-btn:hover:not(.active) { color: var(--text-muted); }
 
-.search-wrap { position: relative; margin-bottom: 8px; }
+.search-wrap { position: relative; margin-bottom: 10px; }
 
 .search-icon {
   position: absolute;
-  left: 9px;
+  left: 0;
   top: 50%;
   transform: translateY(-50%);
-  color: var(--text-muted);
+  color: var(--text-faint);
   font-size: 13px;
   pointer-events: none;
 }
 
+/* Search is now a bare input with a bottom rule — borderless, CRED-style. */
 .search-box {
   width: 100%;
-  padding: 7px 32px 7px 30px;
-  background: var(--bg-raised);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  padding: 10px 48px 10px 18px;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--border-subtle);
   color: var(--text);
+  font-family: var(--font-ui);
   font-size: 13px;
   outline: none;
-  transition: border-color 0.15s, background 0.15s;
+  transition: border-color 200ms var(--ease-quint);
 }
-.search-box:focus { border-color: var(--accent); background: var(--bg-elevated); }
-.search-box::placeholder { color: var(--text-faint); }
+.search-box:focus { border-bottom-color: var(--accent); }
+.search-box::placeholder { color: var(--text-faint); letter-spacing: -0.01em; }
 
 .search-mode-toggle {
   position: absolute;
-  right: 6px;
+  right: 0;
   top: 50%;
   transform: translateY(-50%);
-  padding: 2px 6px;
+  padding: 4px 8px;
   font-size: 10px;
   font-weight: 600;
-  border: 1px solid var(--border);
-  background: var(--bg);
-  color: var(--text-muted);
-  border-radius: 4px;
+  border: 1px solid var(--border-subtle);
+  background: transparent;
+  color: var(--text-faint);
+  border-radius: var(--radius-pill);
   cursor: pointer;
-  transition: all 0.15s;
-  letter-spacing: 0.02em;
+  transition: color 140ms var(--ease-quint), border-color 140ms var(--ease-quint), background 140ms var(--ease-quint);
+  letter-spacing: 0.08em;
+  font-family: var(--font-mono);
 }
-.search-mode-toggle:hover { color: var(--accent); border-color: var(--accent); }
-.search-mode-toggle.active { background: var(--accent-dim); color: var(--accent-bright); border-color: var(--accent); }
+.search-mode-toggle:hover { color: var(--text); border-color: var(--text-muted); }
+.search-mode-toggle.active { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
 
-.filter-row { display: flex; gap: 6px; }
+.filter-row { display: flex; gap: 10px; margin-top: 2px; }
 
 .filter-select {
   flex: 1;
   min-width: 0;
-  padding: 5px 8px;
-  background: var(--bg-raised);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  color: var(--text);
+  padding: 6px 2px;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  font-family: var(--font-ui);
   font-size: 12px;
   outline: none;
   cursor: pointer;
-  transition: border-color 0.15s;
+  transition: color 140ms var(--ease-quint), border-color 140ms var(--ease-quint);
+  appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, var(--text-faint) 50%),
+                    linear-gradient(135deg, var(--text-faint) 50%, transparent 50%);
+  background-position: calc(100% - 10px) 50%, calc(100% - 6px) 50%;
+  background-size: 4px 4px;
+  background-repeat: no-repeat;
+  padding-right: 18px;
 }
-.filter-select:focus { border-color: var(--accent); }
+.filter-select:hover { color: var(--text); }
+.filter-select:focus { border-bottom-color: var(--accent); color: var(--text); }
 
 /* ── Conversation list ── */
-.conv-list { flex: 1; overflow-y: auto; padding: 6px; }
+.conv-list { flex: 1; overflow-y: auto; padding: 4px 0; }
 
 .conv-item {
-  padding: 10px 11px;
-  border-radius: var(--radius-sm);
+  padding: 14px 20px;
   cursor: pointer;
-  border: 1px solid transparent;
-  margin-bottom: 2px;
-  transition: all 0.12s;
+  border: none;
+  border-bottom: 1px solid var(--border-subtle);
+  margin: 0;
+  transition: background 140ms var(--ease-quint);
   position: relative;
 }
-.conv-item:hover { background: var(--bg-raised); border-color: var(--border); }
-.conv-item.active { background: var(--accent-dim); border-color: rgba(139,92,246,0.3); }
-.conv-item.active:hover { background: var(--accent-dim); }
+.conv-item:hover { background: var(--bg-raised); }
+.conv-item.active {
+  background: var(--bg-raised);
+}
+.conv-item.active::before {
+  content: "";
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 2px;
+  background: var(--accent);
+}
 
-.conv-item-top { display: flex; align-items: flex-start; gap: 6px; margin-bottom: 2px; }
+.conv-item-top { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
 
 .conv-project {
   font-size: 10px;
   font-weight: 600;
-  color: var(--accent-bright);
+  color: var(--text-faint);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  letter-spacing: 0.02em;
+  letter-spacing: 0.12em;
   text-transform: uppercase;
   flex: 1;
   min-width: 0;
+  font-family: var(--font-mono);
 }
 
 .bookmark-btn {
@@ -1027,24 +709,25 @@ body {
   border: none;
   cursor: pointer;
   color: var(--text-faint);
-  font-size: 13px;
+  font-size: 12px;
   padding: 0;
   line-height: 1;
   flex-shrink: 0;
-  transition: color 0.15s, transform 0.1s;
+  transition: color 140ms var(--ease-quint);
 }
-.bookmark-btn:hover { color: var(--yellow); transform: scale(1.15); }
-.bookmark-btn.bookmarked { color: var(--yellow); }
+.bookmark-btn:hover { color: var(--accent); }
+.bookmark-btn.bookmarked { color: var(--accent); }
 
 .conv-title {
-  font-size: 13px;
+  font-size: 13.5px;
   font-weight: 500;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  margin-bottom: 3px;
+  margin-bottom: 4px;
   color: var(--text);
-  line-height: 1.3;
+  line-height: 1.35;
+  letter-spacing: -0.005em;
 }
 
 .conv-preview {
@@ -1054,40 +737,46 @@ body {
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
-  line-height: 1.4;
-  margin-bottom: 5px;
+  line-height: 1.5;
+  margin-bottom: 8px;
   word-break: break-word;
 }
 
 .conv-meta {
   display: flex;
-  align-items: center;
-  gap: 6px;
+  align-items: baseline;
+  gap: 8px;
   font-size: 11px;
-  color: var(--text-muted);
+  color: var(--text-faint);
   flex-wrap: wrap;
+  font-variant-numeric: tabular-nums;
 }
 
-.meta-sep { color: var(--text-faint); }
+.meta-sep { color: var(--text-faint); opacity: 0.5; }
 
+/* Cost: tabular mono, subtle green. No pill. */
 .cost-badge {
-  color: var(--green);
-  font-size: 10px;
-  font-weight: 600;
-  background: var(--green-dim);
-  padding: 1px 5px;
-  border-radius: 10px;
-  border: 1px solid rgba(34,197,94,0.2);
+  color: var(--positive);
+  font-size: 11px;
+  font-weight: 500;
+  background: transparent;
+  padding: 0;
+  border: none;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
 }
 
+/* Model: mono tag. No pill gradient. */
 .model-badge {
-  color: var(--accent-bright);
+  color: var(--text-muted);
   font-size: 10px;
-  background: var(--accent-dim);
-  padding: 1px 5px;
-  border-radius: 10px;
-  border: 1px solid rgba(139,92,246,0.2);
-  max-width: 110px;
+  background: transparent;
+  padding: 0;
+  border: none;
+  font-family: var(--font-mono);
+  letter-spacing: 0.02em;
+  max-width: 140px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1101,7 +790,7 @@ body {
   padding: 4px 8px;
   border-radius: 0 4px 4px 0;
   margin-top: 4px;
-  font-style: italic;
+  
   overflow: hidden;
   display: -webkit-box;
   -webkit-line-clamp: 2;
@@ -1306,7 +995,7 @@ body {
 .thinking-body {
   padding: 0 12px 12px;
   font-size: 13px; line-height: 1.6; color: var(--text-muted);
-  font-style: italic; white-space: pre-wrap; word-break: break-word;
+   white-space: pre-wrap; word-break: break-word;
 }
 
 /* ── Search highlight ── */
@@ -1418,7 +1107,7 @@ pre:hover .copy-btn { opacity: 1; }
   padding-left: 14px;
   color: var(--text-muted);
   margin: 10px 0;
-  font-style: italic;
+  
 }
 
 .message-body h1, .message-body h2 { margin: 18px 0 8px; font-size: 1.15em; }
@@ -1497,21 +1186,793 @@ pre:hover .copy-btn { opacity: 1; }
 }
 .tool-result-header:hover { background: rgba(34,197,94,0.15); }
 
-/* ── Stats panel ── */
-.stats-panel { padding: 28px; overflow-y: auto; height: 100%; }
-.stats-panel h2 { font-size: 20px; font-weight: 700; margin-bottom: 22px; letter-spacing: -0.02em; }
+/* ── Dashboard panel — editorial layout ── */
+.dashboard-panel {
+  padding: 32px 48px 80px;
+  overflow-y: auto;
+  height: 100%;
+  max-width: 1400px;
+}
+
+/* Masthead: oversized serif headline + period label, like a statement header. */
+.dashboard-header {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: end;
+  gap: 24px;
+  padding-bottom: 20px;
+  margin-bottom: 28px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.dashboard-header h2 {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 40px;
+  letter-spacing: -0.035em;
+  color: var(--text);
+  line-height: 0.95;
+}
+.dashboard-header .dash-range {
+  font-size: 10px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* Sub-tabs: text links underlined, no pill container. */
+.dash-subtabs {
+  display: flex;
+  gap: 28px;
+  border-bottom: 1px solid var(--border-subtle);
+  margin-bottom: 28px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.dash-subtabs::-webkit-scrollbar { display: none; }
+.dash-subtab {
+  padding: 0 0 14px;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text-faint);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  transition: color 140ms var(--ease-quint);
+  position: relative;
+  font-family: var(--font-ui);
+  letter-spacing: -0.005em;
+  white-space: nowrap;
+}
+.dash-subtab::after {
+  content: "";
+  position: absolute;
+  left: 0; right: 0; bottom: -1px;
+  height: 1px;
+  background: var(--text);
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 260ms var(--ease-quint);
+}
+.dash-subtab.active { color: var(--text); }
+.dash-subtab.active::after { transform: scaleX(1); }
+.dash-subtab:hover:not(.active) { color: var(--text-muted); }
+
+/* Controls row: period as text links, export as text buttons. */
+.dash-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 18px;
+  margin-bottom: 40px;
+}
+.period-pills {
+  display: flex;
+  gap: 2px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-pill);
+  padding: 2px;
+}
+.period-pill {
+  padding: 5px 14px;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-faint);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+  transition: color 160ms var(--ease-quint), background 160ms var(--ease-quint);
+  font-family: var(--font-ui);
+  letter-spacing: -0.005em;
+}
+.period-pill.active { background: var(--text); color: var(--bg); }
+.period-pill:hover:not(.active) { color: var(--text); }
+
+.dash-actions { margin-left: auto; display: flex; gap: 4px; align-items: center; }
+.dash-btn {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-muted);
+  border-radius: var(--radius-pill);
+  padding: 6px 12px;
+  font-size: 11.5px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: color 140ms var(--ease-quint), border-color 140ms var(--ease-quint);
+  font-family: var(--font-ui);
+  letter-spacing: -0.005em;
+}
+.dash-btn:hover { color: var(--text); border-color: var(--border-subtle); }
+.dash-btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+.dash-btn.primary:hover { filter: brightness(1.05); }
+
+/* ── Statement: one hero number + supporting metrics ── */
+.statement {
+  display: grid;
+  grid-template-columns: 1.4fr 1fr;
+  gap: 64px;
+  padding-bottom: 48px;
+  margin-bottom: 40px;
+  border-bottom: 1px solid var(--border-subtle);
+  align-items: start;
+}
+.statement-hero .stat-label,
+.stat-pair .stat-label {
+  font-size: 10px;
+  font-family: var(--font-mono);
+  color: var(--text-faint);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  margin-bottom: 14px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.statement-hero .stat-label::after,
+.stat-pair .stat-label::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border-subtle);
+}
+.statement-hero .stat-value {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 88px;
+  line-height: 0.95;
+  letter-spacing: -0.045em;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 14px;
+}
+.statement-hero .stat-value .currency {
+  font-size: 36px;
+  vertical-align: 28px;
+  color: var(--text-faint);
+  font-weight: 400;
+  margin-right: 6px;
+  letter-spacing: -0.02em;
+}
+.statement-hero .stat-sub {
+  font-size: 13px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.005em;
+  max-width: 30ch;
+  line-height: 1.45;
+}
+.statement-hero .stat-sub .sep { color: var(--text-faint); margin: 0 10px; }
+
+.statement-secondary {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px 32px;
+  padding-top: 32px;
+}
+.stat-pair .stat-value {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 32px;
+  line-height: 1;
+  letter-spacing: -0.025em;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 6px;
+}
+.stat-pair .stat-value.positive { color: var(--positive); }
+.stat-pair .stat-value.accent { color: var(--accent); }
+.stat-pair .stat-sub {
+  font-size: 11px;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  letter-spacing: 0.04em;
+}
+
+/* ── Section rhythm: numbered editorial headers ── */
+.dash-section { margin-bottom: 56px; position: relative; }
+.dash-section-head {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  margin-bottom: 24px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.dash-section-head .idx {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-faint);
+  letter-spacing: 0.12em;
+}
+.dash-section-head h3 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 24px;
+  color: var(--text);
+  letter-spacing: -0.02em;
+  line-height: 1;
+  text-transform: none;
+}
+.dash-section-head .dash-section-note {
+  font-size: 11px;
+  color: var(--text-faint);
+  margin-left: auto;
+  font-family: var(--font-mono);
+  letter-spacing: 0.04em;
+}
+
+.dash-grid-2 { display: grid; grid-template-columns: 1.3fr 1fr; gap: 48px; }
+.dash-grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 32px; }
+
+/* Cards are rare — prefer hairline-bordered regions. .dash-card is a plain panel. */
+.dash-card {
+  background: transparent;
+  border: none;
+  padding: 0;
+}
+.dash-card h4 {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  margin-bottom: 18px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-family: var(--font-mono);
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.dash-card h4 .hint {
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text-faint);
+  font-size: 10.5px;
+  font-family: var(--font-ui);
+}
+
+/* ── Tables: editorial; hairline rules, tabular numerals. ── */
+.dash-table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+.dash-table th, .dash-table td {
+  text-align: left;
+  padding: 11px 12px 11px 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.dash-table th:last-child, .dash-table td:last-child { padding-right: 0; }
+.dash-table th {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  border-bottom: 1px solid var(--border);
+  padding-top: 0;
+  padding-bottom: 12px;
+  font-family: var(--font-mono);
+}
+.dash-table tr:last-child td { border-bottom: none; }
+.dash-table tr { transition: background 120ms var(--ease-quint); }
+.dash-table tbody tr:hover { background: var(--bg-raised); }
+.dash-table td.num, .dash-table th.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono);
+  letter-spacing: -0.01em;
+}
+.dash-table td.truncate { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dash-table td.mono { font-family: var(--font-mono); font-size: 11.5px; color: var(--text-muted); }
+
+/* ── Bar chart rows — thin, monochrome, accent only for highlighted ── */
+.bar-row { display: flex; align-items: center; gap: 16px; padding: 8px 0; }
+.bar-label {
+  min-width: 140px;
+  font-size: 12px;
+  color: var(--text);
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  letter-spacing: -0.005em;
+}
+.bar-track {
+  flex: 1;
+  height: 4px;
+  background: var(--bg-raised);
+  border-radius: 2px;
+  overflow: hidden;
+  border: none;
+  position: relative;
+}
+.bar-fill {
+  height: 100%;
+  background: var(--text);
+  border-radius: 2px;
+  transition: width 420ms var(--ease-quint);
+  font-size: 0;
+  display: block;
+  padding: 0;
+}
+.bar-value {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+  min-width: 80px;
+  text-align: right;
+}
+.bar-fill.green { background: var(--positive); }
+.bar-fill.cyan  { background: var(--info); }
+.bar-fill.amber { background: var(--warning); }
+.bar-fill.accent { background: var(--accent); }
+
+/* ── Daily cost chart ── */
+.daily-chart-wrap {
+  position: relative;
+  height: 200px;
+  border-top: 1px solid var(--border-subtle);
+  border-bottom: 1px solid var(--border-subtle);
+  padding: 16px 0;
+}
+.daily-chart-wrap canvas { width: 100%; height: 100%; display: block; }
+.daily-chart-legend {
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  font-size: 10px;
+  color: var(--text-faint);
+  margin-top: 10px;
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* ── GitHub-style activity heatmap ── */
+.activity-heatmap {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.activity-months {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding-left: 20px;
+}
+.activity-body {
+  display: flex;
+  gap: 8px;
+}
+.activity-days {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-around;
+  font-size: 9px;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  letter-spacing: 0.08em;
+  padding-top: 2px;
+  min-width: 12px;
+  gap: 2px;
+}
+.activity-grid {
+  display: flex;
+  gap: 3px;
+  flex: 1;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.activity-grid::-webkit-scrollbar { display: none; }
+.activity-week { display: flex; flex-direction: column; gap: 3px; flex-shrink: 0; }
+.activity-cell {
+  width: 11px;
+  height: 11px;
+  border-radius: 2px;
+  background: var(--bg-raised);
+  transition: transform 140ms var(--ease-quint);
+  cursor: default;
+}
+.activity-cell:hover { transform: scale(1.35); }
+.activity-cell.l1 { background: oklch(0.90 0.19 110 / 0.22); }
+.activity-cell.l2 { background: oklch(0.90 0.19 110 / 0.45); }
+.activity-cell.l3 { background: oklch(0.90 0.19 110 / 0.72); }
+.activity-cell.l4 { background: var(--accent); }
+.activity-legend {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.activity-legend .activity-cell { width: 10px; height: 10px; }
+
+/* ── Health grade — typographic, not a box ── */
+.health-tile {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 28px;
+  padding: 28px 0;
+  margin-bottom: 40px;
+  border-top: 1px solid var(--border-subtle);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.health-grade {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 96px;
+  line-height: 0.9;
+  letter-spacing: -0.04em;
+  color: var(--text);
+  border: none;
+  background: transparent;
+  padding: 0;
+  width: auto; height: auto;
+}
+.health-grade.A { color: var(--positive); }
+.health-grade.B { color: var(--info); }
+.health-grade.C { color: var(--warning); }
+.health-grade.D { color: var(--negative); }
+.health-grade.F { color: var(--negative); }
+
+.health-text { display: flex; flex-direction: column; gap: 6px; }
+.health-text .big {
+  font-size: 20px;
+  font-weight: 400;
+  letter-spacing: -0.015em;
+  color: var(--text);
+  font-family: var(--font-display);
+  font-weight: 600;
+  line-height: 1.1;
+}
+.health-text .small {
+  font-size: 11px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono);
+  letter-spacing: 0.04em;
+}
+.health-score {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 40px;
+  color: var(--text-muted);
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+.health-score .max { font-size: 24px; color: var(--text-faint); vertical-align: 12px; }
+
+/* ── Optimize findings — editorial cards with leading numerals. ── */
+.finding {
+  display: grid;
+  grid-template-columns: 48px 1fr auto;
+  gap: 20px;
+  padding: 24px 0;
+  border: none;
+  border-bottom: 1px solid var(--border-subtle);
+  border-radius: 0;
+  margin: 0;
+  background: transparent;
+  align-items: start;
+}
+.finding-number {
+  font-family: var(--font-mono);
+  font-weight: 500;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--text-faint);
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+.finding-main { display: flex; flex-direction: column; gap: 10px; }
+.finding-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.finding-title {
+  font-size: 18px;
+  font-weight: 400;
+  color: var(--text);
+  font-family: var(--font-display);
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  line-height: 1.2;
+}
+.finding-impact {
+  font-size: 9.5px;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  padding: 2px 0;
+  font-family: var(--font-mono);
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  line-height: 1;
+}
+.finding-impact::before {
+  content: "·";
+  margin-right: 8px;
+  color: currentColor;
+}
+.finding-impact.high { color: var(--negative); }
+.finding-impact.medium { color: var(--warning); }
+.finding-impact.low { color: var(--info); }
+.finding-tokens {
+  font-size: 10px;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  letter-spacing: 0.04em;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  padding-top: 4px;
+}
+.finding-body {
+  font-size: 13.5px;
+  line-height: 1.55;
+  color: var(--text-muted);
+  max-width: 68ch;
+  letter-spacing: -0.005em;
+}
+.finding-fix {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+  font-size: 11.5px;
+  color: var(--text);
+  margin-top: 4px;
+}
+.finding-fix-label {
+  font-size: 10px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  margin-bottom: 8px;
+  display: flex;
+  justify-content: space-between;
+  font-family: var(--font-mono);
+}
+.finding-fix pre {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--accent);
+  line-height: 1.6;
+  letter-spacing: 0;
+}
+.copy-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-faint);
+  font-size: 10px;
+  cursor: pointer;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-family: var(--font-mono);
+  transition: color 140ms var(--ease-quint);
+}
+.copy-btn:hover { color: var(--accent); }
+
+/* ── Compare grid ── */
+.compare-grid { display: grid; gap: 0; }
+.compare-grid > div {
+  padding: 12px 16px 12px 0;
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: 13.5px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.005em;
+}
+.compare-grid > div:first-child { padding-left: 0; }
+.compare-grid .compare-header {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--text-faint);
+  font-weight: 500;
+  border-bottom: 1px solid var(--border);
+  font-family: var(--font-mono);
+  padding-top: 0;
+  padding-bottom: 12px;
+}
+.compare-grid .compare-section {
+  grid-column: 1/-1;
+  font-size: 10px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  padding: 28px 0 12px;
+  font-weight: 500;
+  font-family: var(--font-mono);
+  border-bottom: none;
+}
+.compare-grid .compare-metric { color: var(--text-muted); }
+.compare-grid .compare-value {
+  color: var(--text);
+  font-family: var(--font-mono);
+  letter-spacing: -0.01em;
+}
+
+/* ── Yield: stacked bar (single hue, opacity-graded). ── */
+.yield-pie { display: flex; gap: 16px; align-items: center; }
+.yield-bar {
+  flex: 1; display: flex; height: 6px; border-radius: 3px; overflow: hidden;
+  border: none; background: var(--bg-raised);
+}
+.yield-seg-productive { background: var(--positive); }
+.yield-seg-reverted   { background: var(--negative); }
+.yield-seg-abandoned  { background: var(--text-faint); }
+.yield-seg-no-git     { background: var(--bg-elevated); }
+.yield-legend {
+  display: flex; gap: 18px; flex-wrap: wrap; font-size: 11px;
+  color: var(--text-muted); margin-top: 14px;
+  font-family: var(--font-mono); letter-spacing: 0.04em;
+  font-variant-numeric: tabular-nums;
+}
+.yield-legend .dot {
+  width: 8px; height: 8px; border-radius: 2px; display: inline-block; margin-right: 6px;
+  vertical-align: 0.5px;
+}
+
+/* ── Plan progress ── */
+.plan-bar-wrap { display: flex; align-items: center; gap: 16px; margin-top: 10px; }
+.plan-bar {
+  flex: 1; height: 2px;
+  background: var(--border-subtle);
+  overflow: hidden; border-radius: 1px;
+}
+.plan-bar-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 520ms var(--ease-quint);
+}
+.plan-pct {
+  font-size: 12px; color: var(--text);
+  font-variant-numeric: tabular-nums;
+  min-width: 52px; text-align: right;
+  font-family: var(--font-mono); letter-spacing: -0.01em;
+}
+
+/* ── Category tag — muted; single hue via text color only. ── */
+.cat-tag {
+  display: inline-block; padding: 0;
+  font-size: 11.5px; font-weight: 400; letter-spacing: -0.005em;
+  background: transparent; color: var(--text-muted);
+  font-family: var(--font-ui);
+  position: relative; padding-left: 10px;
+}
+.cat-tag::before {
+  content: ""; position: absolute; left: 0; top: 50%;
+  width: 4px; height: 4px; border-radius: 50%; transform: translateY(-50%);
+  background: currentColor;
+}
+.cat-tag.coding        { color: oklch(0.82 0.14 280); }
+.cat-tag.feature       { color: oklch(0.82 0.14 220); }
+.cat-tag.debugging     { color: oklch(0.74 0.17 25);  }
+.cat-tag.refactoring   { color: oklch(0.80 0.14 65);  }
+.cat-tag.testing       { color: var(--positive);      }
+.cat-tag.exploration   { color: oklch(0.78 0.12 205); }
+.cat-tag.planning      { color: oklch(0.80 0.14 310); }
+.cat-tag.delegation    { color: oklch(0.78 0.15 340); }
+.cat-tag.git           { color: oklch(0.78 0.15 50);  }
+.cat-tag\/build\/deploy { color: var(--warning);      }
+.cat-tag.brainstorming { color: oklch(0.85 0.12 200); }
+.cat-tag.conversation  { color: var(--text-faint);    }
+.cat-tag.general       { color: var(--text-faint);    }
+.cat-tag.productive    { color: var(--positive);      }
+.cat-tag.reverted      { color: var(--negative);      }
+.cat-tag.abandoned     { color: var(--text-faint);    }
+.cat-tag.no-git        { color: var(--text-faint);    }
+
+.one-shot-bar {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono); font-size: 11px;
+  color: var(--text-muted);
+  letter-spacing: -0.01em;
+}
+.one-shot-bar .mini-track {
+  width: 50px; height: 2px;
+  background: var(--border-subtle);
+  overflow: hidden; border: none; border-radius: 1px;
+}
+.one-shot-bar .mini-fill { height: 100%; background: var(--positive); }
+.one-shot-bar.warn .mini-fill { background: var(--warning); }
+.one-shot-bar.bad .mini-fill { background: var(--negative); }
+
+.dash-empty {
+  padding: 24px 0; text-align: left;
+  color: var(--text-faint); font-size: 12.5px;
+  font-family: var(--font-ui);
+}
 
 /* ── Settings panel ── */
-.settings-panel { padding: 28px; overflow-y: auto; height: 100%; max-width: 560px; }
-.settings-panel h2 { font-size: 20px; font-weight: 700; margin-bottom: 24px; letter-spacing: -0.02em; }
-.settings-section { background: var(--bg-raised); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px 20px; margin-bottom: 16px; }
-.settings-section-title { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-muted); margin-bottom: 14px; }
-.settings-row { display: flex; align-items: baseline; gap: 12px; padding: 5px 0; border-bottom: 1px solid var(--border-subtle); }
+.settings-panel {
+  padding: 40px 48px 80px; overflow-y: auto; height: 100%;
+  max-width: 720px;
+}
+.settings-panel h2 {
+  font-family: var(--font-display); font-weight: 700;
+  font-size: 36px; letter-spacing: -0.03em;
+  margin-bottom: 32px; padding-bottom: 20px;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text);
+}
+.settings-section {
+  background: transparent; border: none;
+  padding: 0; margin-bottom: 36px;
+  border-bottom: 1px solid var(--border-subtle);
+  padding-bottom: 28px;
+}
+.settings-section:last-of-type { border-bottom: none; }
+.settings-section-title {
+  font-size: 10px; font-weight: 500;
+  text-transform: uppercase; letter-spacing: 0.14em;
+  color: var(--text-faint); margin-bottom: 18px;
+  font-family: var(--font-mono);
+}
+.settings-row {
+  display: flex; align-items: baseline; gap: 16px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
 .settings-row:last-of-type { border-bottom: none; }
-.settings-label { font-size: 12px; color: var(--text-muted); min-width: 90px; flex-shrink: 0; }
-.settings-value { font-size: 13px; color: var(--text); }
-.settings-actions { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
-.settings-btn { background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text); border-radius: var(--radius-sm); padding: 6px 14px; font-size: 12px; cursor: pointer; }
+.settings-label {
+  font-size: 11.5px; color: var(--text-muted);
+  min-width: 110px; flex-shrink: 0;
+  letter-spacing: -0.005em;
+}
+.settings-value {
+  font-size: 13.5px; color: var(--text);
+  font-variant-numeric: tabular-nums; letter-spacing: -0.005em;
+}
+.settings-actions { display: flex; gap: 8px; margin-top: 18px; flex-wrap: wrap; }
+.settings-btn {
+  background: transparent;
+  border: 1px solid var(--border-subtle);
+  color: var(--text);
+  border-radius: var(--radius-pill);
+  padding: 7px 16px; font-size: 12px; cursor: pointer;
+  font-family: var(--font-ui); letter-spacing: -0.005em;
+  transition: color 140ms var(--ease-quint), border-color 140ms var(--ease-quint);
+}
 .settings-btn:hover { background: var(--bg-surface); border-color: var(--accent); }
 .settings-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .settings-btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
@@ -1679,18 +2140,24 @@ pre:hover .copy-btn { opacity: 1; }
   .back-btn { display: flex; }
   .messages-container { padding: 14px; }
   .message { padding: 12px 14px; }
-  .stats-panel { padding: 16px; }
-  .stats-grid { grid-template-columns: repeat(2, 1fr); gap: 10px; }
-  .stat-value { font-size: 22px; }
+  .dashboard-panel { padding: 16px; }
+  .dash-kpis { grid-template-columns: repeat(2, 1fr); gap: 10px; }
+  .kpi-card .kpi-value { font-size: 18px; }
   .bar-label { min-width: 100px; }
   .filter-row { flex-direction: column; }
+  .dash-grid-2 { grid-template-columns: 1fr; }
+  .compare-grid { grid-template-columns: 1fr; }
+  .compare-grid > div { border-bottom: 1px solid var(--border-subtle); }
 }
 
 @media (max-width: 480px) {
   .sidebar-header { padding: 10px; }
   .conv-list { padding: 4px; }
   .conv-item { padding: 9px 10px; }
-  .stats-grid { grid-template-columns: 1fr 1fr; gap: 8px; }
+  .dash-kpis { grid-template-columns: 1fr 1fr; gap: 8px; }
+  .dashboard-header { flex-direction: column; align-items: flex-start; }
+  .dash-controls { flex-direction: column; align-items: stretch; }
+  .dash-actions { margin-left: 0; }
 }
 </style>
 </head>
@@ -1709,10 +2176,8 @@ pre:hover .copy-btn { opacity: 1; }
   <div class="sidebar">
     <div class="sidebar-header">
       <div class="brand">
-        <div class="brand-icon">&#9670;</div>
-        <div>
-          <div class="brand-text">Claude Conversations</div>
-        </div>
+        <div class="brand-icon">Ledger</div>
+        <div class="brand-text">Claude&nbsp;Code accounts</div>
         <div class="brand-actions">
           <button class="icon-btn" id="refreshBtn" onclick="triggerRefresh()" title="Refresh conversations">&#8635;</button>
           <div class="icon-btn" style="position:relative; cursor:default;" title="Export all">
@@ -1727,7 +2192,7 @@ pre:hover .copy-btn { opacity: 1; }
       <div class="tabs">
         <button class="tab-btn active" data-tab="conversations" onclick="switchTab('conversations')">Conversations</button>
         <button class="tab-btn" data-tab="bookmarked" onclick="switchTab('bookmarked')">&#9733; Saved</button>
-        <button class="tab-btn" data-tab="stats" onclick="switchTab('stats')">Stats</button>
+        <button class="tab-btn" data-tab="dashboard" onclick="switchTab('dashboard')">Dashboard</button>
         <button class="tab-btn" data-tab="settings" onclick="switchTab('settings')">&#9881; Settings</button>
       </div>
       <div class="search-wrap" id="searchWrap">
@@ -1803,8 +2268,8 @@ pre:hover .copy-btn { opacity: 1; }
       </div>
     </div>
 
-    <div class="stats-panel" id="statsPanel" style="display:none">
-      <div class="loading"><div class="spinner"></div> Loading stats…</div>
+    <div class="dashboard-panel" id="dashboardPanel" style="display:none">
+      <div class="loading"><div class="spinner"></div> Loading dashboard…</div>
     </div>
 
     <div class="settings-panel" id="settingsPanel" style="display:none">
@@ -2107,27 +2572,27 @@ function switchTab(tab) {
 
   const header = document.getElementById('mainHeader');
   const msgs = document.getElementById('messagesContainer');
-  const stats = document.getElementById('statsPanel');
+  const dash = document.getElementById('dashboardPanel');
   const settings = document.getElementById('settingsPanel');
   const searchWrap = document.getElementById('searchWrap');
   const filterRow = document.querySelector('.filter-row');
 
-  if (tab === 'stats') {
+  if (tab === 'dashboard') {
     header.style.display = 'none';
     msgs.style.display = 'none';
-    stats.style.display = 'block';
+    dash.style.display = 'block';
     settings.style.display = 'none';
-    loadStats();
+    loadDashboard();
   } else if (tab === 'settings') {
     header.style.display = 'none';
     msgs.style.display = 'none';
-    stats.style.display = 'none';
+    dash.style.display = 'none';
     settings.style.display = 'block';
     loadSettings();
   } else {
     header.style.display = 'block';
     msgs.style.display = 'block';
-    stats.style.display = 'none';
+    dash.style.display = 'none';
     settings.style.display = 'none';
     if (!currentConvId) document.getElementById('sessionBar').style.display = 'none';
   }
@@ -2141,7 +2606,7 @@ function switchTab(tab) {
 
 // ── Search ──
 function onSearchInput() {
-  if (currentTab === 'stats') return;
+  if (currentTab === 'dashboard') return;
   clearTimeout(searchDebounce);
   if (contentSearchMode) {
     searchDebounce = setTimeout(runContentSearch, 400);
@@ -2637,94 +3102,704 @@ function exportAll(fmt) {
   window.open(`/api/export-all?format=${fmt}`, '_blank');
 }
 
-// ── Stats ──
-async function loadStats() {
-  const panel = document.getElementById('statsPanel');
-  panel.innerHTML = '<div class="loading"><div class="spinner"></div> Loading stats…</div>';
+// ── Dashboard ──
+const DASH_STATE = { period: '7d', subtab: 'overview', lastData: null, lastOptimize: null, lastCompare: null, lastYield: null, findings: [] };
+const PERIODS = [
+  {key: 'today', label: 'Today'},
+  {key: '7d',    label: '7 Days'},
+  {key: '30d',   label: '30 Days'},
+  {key: 'month', label: 'Month'},
+  {key: 'all',   label: 'All Time'},
+];
 
-  const res = await fetch('/api/stats');
-  const s = await res.json();
+async function loadDashboard() {
+  const panel = document.getElementById('dashboardPanel');
+  panel.innerHTML = '<div class="loading"><div class="spinner"></div> Loading dashboard…</div>';
+  await renderDashboardShell();
+  await renderSubtab();
+}
 
-  const totalCost = formatCost(s.total_cost_usd);
-  const heatmapHtml = buildHeatmap(s.daily_activity || {});
-
-  const modelBars = Object.entries(s.model_usage || {}).map(([m, cnt]) => {
-    const max = Math.max(...Object.values(s.model_usage));
-    const pct = (cnt / max * 100).toFixed(0);
-    return `<div class="bar-row">
-      <div class="bar-label" title="${escapeHtml(m)}">${escapeHtml(cleanModelName(m))}</div>
-      <div class="bar-track"><div class="bar-fill" style="width:${pct}%">${cnt}</div></div>
-    </div>`;
-  }).join('');
-
-  const projectBars = Object.entries(s.project_counts || {}).slice(0,10).map(([p, cnt]) => {
-    const max = Math.max(...Object.values(s.project_counts));
-    const pct = (cnt / max * 100).toFixed(0);
-    return `<div class="bar-row">
-      <div class="bar-label" title="${escapeHtml(p)}">${escapeHtml(shortenPath(p))}</div>
-      <div class="bar-track"><div class="bar-fill" style="width:${pct}%">${cnt}</div></div>
-    </div>`;
-  }).join('');
-
+async function renderDashboardShell() {
+  const panel = document.getElementById('dashboardPanel');
   panel.innerHTML = `
-    <h2>Usage Statistics</h2>
-    <div class="stats-grid">
-      <div class="stat-card">
-        <div class="stat-card-icon">&#128172;</div>
-        <div class="stat-value">${s.total_conversations}</div>
-        <div class="stat-label">Conversations</div>
+    <div class="dashboard-header">
+      <h2>Dashboard</h2>
+      <div class="dash-range" id="dashRangeLabel">—</div>
+    </div>
+    <div class="dash-subtabs">
+      ${['overview','optimize','compare','yield','plan'].map(s =>
+        `<button class="dash-subtab${DASH_STATE.subtab===s?' active':''}" onclick="setDashSubtab('${s}')">${s.charAt(0).toUpperCase()+s.slice(1)}</button>`
+      ).join('')}
+    </div>
+    <div class="dash-controls">
+      <div class="period-pills" id="periodPills">
+        ${PERIODS.map(p => `<button class="period-pill${DASH_STATE.period===p.key?' active':''}" data-period="${p.key}" onclick="setDashPeriod('${p.key}')">${p.label}</button>`).join('')}
       </div>
-      <div class="stat-card">
-        <div class="stat-card-icon">&#128193;</div>
-        <div class="stat-value">${s.total_projects}</div>
-        <div class="stat-label">Projects</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-card-icon">&#128172;</div>
-        <div class="stat-value">${formatTokens(s.total_messages)}</div>
-        <div class="stat-label">Messages</div>
-      </div>
-      <div class="stat-card cost">
-        <div class="stat-card-icon">&#128178;</div>
-        <div class="stat-value">${totalCost || '$0.00'}</div>
-        <div class="stat-label">Est. Total Cost</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-card-icon">&#8595;</div>
-        <div class="stat-value">${formatTokens(s.total_input_tokens)}</div>
-        <div class="stat-label">Input Tokens</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-card-icon">&#8593;</div>
-        <div class="stat-value">${formatTokens(s.total_output_tokens)}</div>
-        <div class="stat-label">Output Tokens</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-card-icon">&#9400;</div>
-        <div class="stat-value">${formatTokens(s.total_cache_read_tokens)}</div>
-        <div class="stat-label">Cache Read Tokens</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-card-icon">&#128190;</div>
-        <div class="stat-value">${formatTokens(s.total_cache_creation_tokens)}</div>
-        <div class="stat-label">Cache Created</div>
+      <div class="dash-actions">
+        <button class="dash-btn" onclick="downloadDashboard('csv')" title="Download CSV">&#8623; CSV</button>
+        <button class="dash-btn" onclick="downloadDashboard('json')" title="Download JSON">&#8623; JSON</button>
+        <button class="dash-btn" onclick="loadDashboard()" title="Refresh">&#8635; Refresh</button>
       </div>
     </div>
+    <div id="dashBody"></div>`;
+}
 
-    <div class="stats-section">
-      <h3>Activity — last 52 weeks</h3>
-      <div class="heatmap-container">${heatmapHtml}</div>
-    </div>
+async function setDashPeriod(p) {
+  DASH_STATE.period = p;
+  document.querySelectorAll('.period-pill').forEach(b => b.classList.toggle('active', b.dataset.period === p));
+  await renderSubtab();
+}
 
-    <div class="stats-section">
-      <h3>Model Usage</h3>
-      <div class="stats-bar-chart">${modelBars || '<div style="color:var(--text-muted)">No data</div>'}</div>
-    </div>
+async function setDashSubtab(s) {
+  DASH_STATE.subtab = s;
+  document.querySelectorAll('.dash-subtab').forEach(b => b.classList.toggle('active', b.textContent.toLowerCase() === s));
+  await renderSubtab();
+}
 
-    <div class="stats-section">
-      <h3>Top Projects</h3>
-      <div class="stats-bar-chart">${projectBars || '<div style="color:var(--text-muted)">No data</div>'}</div>
+async function renderSubtab() {
+  const body = document.getElementById('dashBody');
+  body.innerHTML = '<div class="loading"><div class="spinner"></div> Computing…</div>';
+  const s = DASH_STATE.subtab;
+  if (s === 'overview') await renderOverview();
+  else if (s === 'optimize') await renderOptimize();
+  else if (s === 'compare') await renderCompare();
+  else if (s === 'yield') await renderYield();
+  else if (s === 'plan') await renderPlan();
+}
+
+function rangeLabel(d) {
+  if (!d || !d.range) return '';
+  if (!d.range.from) return 'All time';
+  const from = d.range.from.slice(0,10);
+  const to = d.range.to ? d.range.to.slice(0,10) : '—';
+  return `${from} → ${to}`;
+}
+
+async function renderOverview() {
+  const body = document.getElementById('dashBody');
+  const [dr, hr] = await Promise.all([
+    fetch(`/api/dashboard?period=${DASH_STATE.period}`).then(r => r.json()),
+    fetch('/api/dashboard?period=all').then(r => r.json()),
+  ]);
+  const d = dr;
+  const allData = hr;
+  DASH_STATE.lastData = d;
+  document.getElementById('dashRangeLabel').textContent = rangeLabel(d);
+
+  const ov = d.overview;
+  const plan = d.plan;
+
+  const planHtml = plan ? `
+    <div class="dash-section" style="margin-bottom:40px;">
+      <div class="dash-section-head">
+        <span class="idx">00</span>
+        <h3>Plan</h3>
+        <span class="dash-section-note">${escapeHtml(plan.preset)} · $${plan.monthly_usd}/mo</span>
+      </div>
+      <div class="plan-bar-wrap">
+        <div class="plan-bar"><div class="plan-bar-fill" style="width:${Math.min(plan.percent_used,100)}%"></div></div>
+        <div class="plan-pct">${plan.percent_used}%</div>
+      </div>
+      <div style="font-size:11.5px;color:var(--text-muted);margin-top:10px;letter-spacing:-0.005em;">
+        ${formatCost(plan.month_cost)} API-equivalent spend this month against a $${plan.monthly_usd} plan price.
+      </div>
+    </div>` : '';
+
+  // Hero statement — cost as the single dominant number
+  const costFormatted = formatCost(ov.cost);
+  const [costCurr, ...costRest] = costFormatted.split('');
+  const statement = `
+    <div class="statement">
+      <div class="statement-hero">
+        <div class="stat-label">spend &middot; ${DASH_STATE.period}</div>
+        <div class="stat-value" data-numeric><span class="currency">${escapeHtml(costCurr || '$')}</span>${escapeHtml(costRest.join(''))}</div>
+        <div class="stat-sub">
+          <span>${ov.calls.toLocaleString()} calls</span>
+          <span class="sep">/</span>
+          <span>${ov.sessions} sessions</span>
+          <span class="sep">/</span>
+          <span>avg ${formatCost(ov.avg_cost_per_session)}</span>
+        </div>
+      </div>
+      <div class="statement-secondary">
+        <div class="stat-pair">
+          <div class="stat-label">today</div>
+          <div class="stat-value positive" data-numeric>${formatCost(ov.today_cost)}</div>
+          <div class="stat-sub">single day</div>
+        </div>
+        <div class="stat-pair">
+          <div class="stat-label">month</div>
+          <div class="stat-value positive" data-numeric>${formatCost(ov.month_cost)}</div>
+          <div class="stat-sub">calendar month</div>
+        </div>
+        <div class="stat-pair">
+          <div class="stat-label">cache</div>
+          <div class="stat-value accent" data-numeric>${ov.cache_hit_rate_pct != null ? ov.cache_hit_rate_pct + '%' : '—'}</div>
+          <div class="stat-sub">${formatTokens(ov.cache_read_tokens)} cached</div>
+        </div>
+        <div class="stat-pair">
+          <div class="stat-label">tokens</div>
+          <div class="stat-value" data-numeric>${formatTokens(ov.total_tokens)}</div>
+          <div class="stat-sub">${formatTokens(ov.output_tokens)} output</div>
+        </div>
+      </div>
     </div>`;
+
+  const heatmap = renderActivityHeatmap(allData.daily || []);
+  const dailyChart = renderDailyChart(d.daily);
+  const activities = renderActivities(d.activities);
+  const models = renderModels(d.models);
+  const projects = renderProjects(d.projects);
+  const core = renderCoreTools(d.core_tools);
+  const shell = renderShell(d.shell);
+  const mcp = renderMcp(d.mcp);
+  const top = renderTopSessions(d.top_sessions);
+
+  body.innerHTML = planHtml + statement + `
+    <div class="dash-section">
+      <div class="dash-section-head">
+        <span class="idx">01</span>
+        <h3>Activity</h3>
+        <span class="dash-section-note">last 52 weeks</span>
+      </div>
+      ${heatmap}
+    </div>
+    <div class="dash-section">
+      <div class="dash-section-head">
+        <span class="idx">02</span>
+        <h3>Daily cost</h3>
+        <span class="dash-section-note">${d.daily.length} days</span>
+      </div>
+      ${dailyChart}
+    </div>
+    <div class="dash-section">
+      <div class="dash-section-head">
+        <span class="idx">03</span>
+        <h3>Activities &amp; models</h3>
+        <span class="dash-section-note">one-shot = edits without retry</span>
+      </div>
+      <div class="dash-grid-2">
+        <div class="dash-card"><h4>By category</h4>${activities}</div>
+        <div class="dash-card"><h4>By model</h4>${models}</div>
+      </div>
+    </div>
+    <div class="dash-section">
+      <div class="dash-section-head">
+        <span class="idx">04</span>
+        <h3>Projects &amp; tools</h3>
+      </div>
+      <div class="dash-grid-2">
+        <div class="dash-card"><h4>Top projects</h4>${projects}</div>
+        <div class="dash-card"><h4>Core tools</h4>${core}</div>
+      </div>
+    </div>
+    <div class="dash-section">
+      <div class="dash-section-head">
+        <span class="idx">05</span>
+        <h3>Shell &amp; MCP</h3>
+      </div>
+      <div class="dash-grid-2">
+        <div class="dash-card"><h4>Shell commands</h4>${shell}</div>
+        <div class="dash-card"><h4>MCP servers</h4>${mcp}</div>
+      </div>
+    </div>
+    <div class="dash-section">
+      <div class="dash-section-head">
+        <span class="idx">06</span>
+        <h3>Expensive sessions</h3>
+        <span class="dash-section-note">top 5 this period</span>
+      </div>
+      ${top}
+    </div>`;
+  setTimeout(drawDailyChart, 20);
+}
+
+// Build GitHub-style heatmap. Uses the `all-time` daily payload.
+function renderActivityHeatmap(daily) {
+  const today = new Date();
+  // Align to Sunday-start week
+  const endDay = new Date(today);
+  endDay.setHours(0, 0, 0, 0);
+  const totalDays = 52 * 7;
+  const startDay = new Date(endDay);
+  startDay.setDate(endDay.getDate() - totalDays + 1);
+  // Back up to previous Sunday
+  startDay.setDate(startDay.getDate() - startDay.getDay());
+
+  const costByDay = {};
+  let maxCost = 0;
+  daily.forEach(r => {
+    costByDay[r.date] = r.cost;
+    if (r.cost > maxCost) maxCost = r.cost;
+  });
+
+  const cells = [];
+  const cur = new Date(startDay);
+  while (cur <= endDay) {
+    const key = cur.toISOString().slice(0, 10);
+    const c = costByDay[key] || 0;
+    cells.push({ date: key, cost: c });
+    cur.setDate(cur.getDate() + 1);
+  }
+
+  const weeks = [];
+  for (let i = 0; i < cells.length; i += 7) weeks.push(cells.slice(i, i + 7));
+
+  const levelFor = (c) => {
+    if (c === 0 || maxCost === 0) return 0;
+    const r = c / maxCost;
+    if (r < 0.15) return 1;
+    if (r < 0.4) return 2;
+    if (r < 0.7) return 3;
+    return 4;
+  };
+
+  // Month labels — name appears over the first week that falls in that month
+  const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const monthLabels = weeks.map((week, i) => {
+    const first = new Date(week[0].date);
+    if (i === 0) return MONTHS[first.getMonth()];
+    const prev = new Date(weeks[i - 1][0].date);
+    return first.getMonth() !== prev.getMonth() ? MONTHS[first.getMonth()] : '';
+  });
+
+  const weeksHtml = weeks.map((week, wi) => {
+    return `<div class="activity-week">` +
+      week.map(d => {
+        const lvl = levelFor(d.cost);
+        const title = d.cost > 0 ? `${d.date} · ${formatCost(d.cost)}` : `${d.date} · no activity`;
+        return `<div class="activity-cell${lvl ? ' l'+lvl : ''}" title="${title}"></div>`;
+      }).join('') + `</div>`;
+  }).join('');
+
+  // Render month label row with gaps — one label per week slot
+  const monthRow = monthLabels.map((m, i) => {
+    return `<span style="flex:0 0 14px;text-align:left;">${m}</span>`;
+  }).join('');
+
+  return `
+    <div class="activity-heatmap">
+      <div class="activity-months" style="display:flex;gap:0;padding-left:20px;">${monthRow}</div>
+      <div class="activity-body">
+        <div class="activity-days"><span>Mon</span><span>Wed</span><span>Fri</span></div>
+        <div class="activity-grid">${weeksHtml}</div>
+      </div>
+      <div class="activity-legend">
+        Less
+        <div class="activity-cell"></div>
+        <div class="activity-cell l1"></div>
+        <div class="activity-cell l2"></div>
+        <div class="activity-cell l3"></div>
+        <div class="activity-cell l4"></div>
+        More
+      </div>
+    </div>`;
+}
+
+function renderActivities(items) {
+  if (!items || !items.length) return '<div class="dash-empty">No data in this period</div>';
+  const maxCalls = Math.max(...items.map(a => a.calls), 1);
+  const rows = items.filter(a => a.calls > 0).map(a => {
+    const pct = (a.calls / maxCalls * 100).toFixed(0);
+    let oneShotHtml = '—';
+    if (a.one_shot_rate != null) {
+      const cls = a.one_shot_rate >= 75 ? '' : (a.one_shot_rate >= 50 ? 'warn' : 'bad');
+      oneShotHtml = `<span class="one-shot-bar ${cls}"><span class="mini-track"><span class="mini-fill" style="width:${a.one_shot_rate}%"></span></span>${a.one_shot_rate}%</span>`;
+    }
+    return `<tr>
+      <td><span class="cat-tag ${a.category.replace('/','\\/')}">${escapeHtml(a.category)}</span></td>
+      <td class="num">${formatCost(a.cost)}</td>
+      <td class="num">${a.calls}</td>
+      <td class="num">${a.edit_turns || '—'}</td>
+      <td class="num">${oneShotHtml}</td>
+    </tr>`;
+  }).join('');
+  return `<table class="dash-table">
+    <thead><tr><th>Activity</th><th class="num">Cost</th><th class="num">Calls</th><th class="num">Edits</th><th class="num">1-shot</th></tr></thead>
+    <tbody>${rows}</tbody></table>`;
+}
+
+function renderModels(items) {
+  if (!items || !items.length) return '<div class="dash-empty">No data</div>';
+  const max = Math.max(...items.map(m => m.cost), 0.0001);
+  return items.map((m, i) => {
+    const pct = (m.cost / max * 100).toFixed(0);
+    const cls = i === 0 ? ' accent' : '';
+    return `<div class="bar-row">
+      <div class="bar-label" title="${escapeHtml(m.model)}">${escapeHtml(m.label)}</div>
+      <div class="bar-track"><div class="bar-fill${cls}" style="width:${pct}%"></div></div>
+      <div class="bar-value">${formatCost(m.cost)} · ${m.calls}</div>
+    </div>`;
+  }).join('');
+}
+
+function renderProjects(items) {
+  if (!items || !items.length) return '<div class="dash-empty">No data</div>';
+  const rows = items.slice(0, 10).map(p => `<tr>
+    <td class="truncate" title="${escapeHtml(p.project)}">${escapeHtml(shortenPath(p.project))}</td>
+    <td class="num">${formatCost(p.cost)}</td>
+    <td class="num">${p.sessions}</td>
+    <td class="num">${formatCost(p.avg_cost_per_session)}</td>
+  </tr>`).join('');
+  return `<table class="dash-table">
+    <thead><tr><th>Project</th><th class="num">Cost</th><th class="num">Sessions</th><th class="num">Avg/sess</th></tr></thead>
+    <tbody>${rows}</tbody></table>`;
+}
+
+function renderCoreTools(items) {
+  if (!items || !items.length) return '<div class="dash-empty">No data</div>';
+  const max = Math.max(...items.map(t => t.count), 1);
+  return items.map(t => {
+    const pct = (t.count / max * 100).toFixed(0);
+    return `<div class="bar-row">
+      <div class="bar-label">${escapeHtml(t.tool)}</div>
+      <div class="bar-track"><div class="bar-fill" style="width:${pct}%"></div></div>
+      <div class="bar-value">${t.count}</div>
+    </div>`;
+  }).join('');
+}
+
+function renderShell(items) {
+  if (!items || !items.length) return '<div class="dash-empty">No shell usage</div>';
+  const max = Math.max(...items.map(t => t.count), 1);
+  return items.slice(0, 15).map(t => {
+    const pct = (t.count / max * 100).toFixed(0);
+    return `<div class="bar-row">
+      <div class="bar-label" title="${escapeHtml(t.command)}" style="font-family:var(--font-mono);font-size:11.5px;color:var(--text-muted);">${escapeHtml(t.command)}</div>
+      <div class="bar-track"><div class="bar-fill" style="width:${pct}%"></div></div>
+      <div class="bar-value">${t.count}</div>
+    </div>`;
+  }).join('');
+}
+
+function renderMcp(items) {
+  if (!items || !items.length) return '<div class="dash-empty">No MCP activity. Configure MCP servers in ~/.claude.json to see breakdown.</div>';
+  const max = Math.max(...items.map(t => t.count), 1);
+  return items.map(t => {
+    const pct = (t.count / max * 100).toFixed(0);
+    return `<div class="bar-row">
+      <div class="bar-label">${escapeHtml(t.server)}</div>
+      <div class="bar-track"><div class="bar-fill green" style="width:${pct}%"></div></div>
+      <div class="bar-value">${t.count}</div>
+    </div>`;
+  }).join('');
+}
+
+function renderTopSessions(items) {
+  if (!items || !items.length) return '<div class="dash-empty">No sessions in this period</div>';
+  const rows = items.map(s => `<tr onclick="jumpToSession('${s.session_id}')" style="cursor:pointer;">
+    <td class="truncate" title="${escapeHtml(s.title)}">${escapeHtml(s.title || s.session_id.slice(0,10))}</td>
+    <td class="truncate" title="${escapeHtml(s.project_path)}">${escapeHtml(shortenPath(s.project_path))}</td>
+    <td class="num">${formatCost(s.cost)}</td>
+    <td class="num">${s.calls}</td>
+    <td class="mono">${(s.first_timestamp||'').slice(0,10)}</td>
+  </tr>`).join('');
+  return `<table class="dash-table">
+    <thead><tr><th>Session</th><th>Project</th><th class="num">Cost</th><th class="num">Calls</th><th>Date</th></tr></thead>
+    <tbody>${rows}</tbody></table>`;
+}
+
+function jumpToSession(id) {
+  switchTab('conversations');
+  setTimeout(() => loadConversation(id), 50);
+}
+
+// ── Daily cost chart (canvas) ──
+function renderDailyChart(daily) {
+  return `<div class="daily-chart-wrap"><canvas id="dailyCanvas"></canvas></div>
+    <div class="daily-chart-legend">
+      <span>${daily.length ? daily[0].date : ''}</span>
+      <span>Peak ${formatCost(Math.max(0, ...daily.map(d=>d.cost)))}</span>
+      <span>${daily.length ? daily[daily.length-1].date : ''}</span>
+    </div>`;
+}
+
+function drawDailyChart() {
+  const canvas = document.getElementById('dailyCanvas');
+  if (!canvas || !DASH_STATE.lastData) return;
+  const data = DASH_STATE.lastData.daily || [];
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, rect.width, rect.height);
+
+  if (!data.length) return;
+  const max = Math.max(...data.map(d => d.cost), 0.0001);
+  const w = rect.width;
+  const h = rect.height;
+  const padL = 36, padR = 10, padT = 8, padB = 22;
+  const plotW = w - padL - padR;
+  const plotH = h - padT - padB;
+
+  // Read theme tokens from CSS so the chart always matches theme.
+  const cs = getComputedStyle(document.documentElement);
+  const accent = cs.getPropertyValue('--accent').trim() || '#E3FF70';
+  const faint = cs.getPropertyValue('--text-faint').trim() || '#555';
+  const subtle = cs.getPropertyValue('--border-subtle').trim() || '#333';
+
+  // Y-grid (3 hairlines)
+  ctx.strokeStyle = subtle;
+  ctx.lineWidth = 1;
+  ctx.fillStyle = faint;
+  ctx.font = '10px "JetBrains Mono", monospace';
+  ctx.textAlign = 'right';
+  for (let i = 0; i <= 3; i++) {
+    const y = padT + plotH * (i / 3);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w - padR, y); ctx.stroke();
+    const val = max * (1 - i / 3);
+    ctx.fillText(val > 0 ? '$' + val.toFixed(val >= 10 ? 0 : 1) : '$0', padL - 6, y + 3);
+  }
+
+  // Bars — solid accent with slight translucency toward base
+  const barW = Math.max(plotW / data.length * 0.68, 2);
+  const step = plotW / data.length;
+  const gap = step * 0.32;
+  data.forEach((d, i) => {
+    const x = padL + i * step + gap / 2;
+    const bh = (d.cost / max) * plotH;
+    const y = padT + plotH - bh;
+    ctx.fillStyle = d.cost > 0 ? accent : subtle;
+    ctx.globalAlpha = d.cost > 0 ? 1 : 0.5;
+    ctx.fillRect(x, y, barW, Math.max(bh, d.cost > 0 ? 1.5 : 1));
+    ctx.globalAlpha = 1;
+  });
+
+  // X-axis labels (first / mid / last)
+  ctx.textAlign = 'center';
+  ctx.fillStyle = faint;
+  const labelIdxs = [0, Math.floor(data.length / 2), data.length - 1];
+  labelIdxs.forEach(i => {
+    if (i < 0 || i >= data.length) return;
+    const x = padL + i * step + step / 2;
+    ctx.fillText(data[i].date.slice(5), x, h - 6);
+  });
+}
+
+window.addEventListener('resize', () => {
+  if (DASH_STATE.subtab === 'overview' && currentTab === 'dashboard') drawDailyChart();
+});
+
+// ── Optimize ──
+async function renderOptimize() {
+  const body = document.getElementById('dashBody');
+  const r = await fetch(`/api/dashboard/optimize?period=${DASH_STATE.period}`);
+  const d = await r.json();
+  DASH_STATE.lastOptimize = d;
+  DASH_STATE.findings = d.findings;
+  document.getElementById('dashRangeLabel').textContent = rangeLabel(d);
+
+  const health = `<div class="health-tile">
+    <div class="health-grade ${d.grade}">${d.grade}</div>
+    <div class="health-text">
+      <div class="big">Setup health</div>
+      <div class="small">${d.findings.length} finding${d.findings.length === 1 ? '' : 's'} · ${d.turns_scanned.toLocaleString()} turns · ${DASH_STATE.period}</div>
+    </div>
+    <div class="health-score" data-numeric>${d.score}<span class="max">/100</span></div>
+  </div>`;
+
+  const findings = d.findings.length ? `
+    <div class="dash-section-head" style="border:none;margin-bottom:8px;">
+      <span class="idx">01</span><h3>Waste patterns</h3>
+      <span class="dash-section-note">${d.findings.length} finding${d.findings.length === 1 ? '' : 's'}</span>
+    </div>
+    ` + d.findings.map((f, i) => `
+    <div class="finding">
+      <div class="finding-number">${String(i + 1).padStart(2, '0')}</div>
+      <div class="finding-main">
+        <div class="finding-head">
+          <span class="finding-title">${escapeHtml(f.title)}</span>
+          <span class="finding-impact ${f.impact}">${f.impact}</span>
+        </div>
+        <div class="finding-body">${escapeHtml(f.explanation)}</div>
+        <div class="finding-fix">
+          <div class="finding-fix-label">
+            <span>${escapeHtml(f.fix.label)}</span>
+            <button class="copy-btn" onclick="copyFindingFix(${i})">Copy</button>
+          </div>
+          <pre id="findingFix${i}">${escapeHtml(f.fix.text)}</pre>
+        </div>
+      </div>
+      <div class="finding-tokens">~${formatTokens(f.tokens_saved)}<br>tokens saved</div>
+    </div>`).join('') : `
+    <div class="dash-empty" style="padding:80px 20px;text-align:center;">
+      <div style="font-family:var(--font-display);font-style:italic;font-size:48px;color:var(--positive);margin-bottom:12px;">clean.</div>
+      <div style="color:var(--text-muted);font-size:13px;">No waste patterns detected in this window.</div>
+    </div>`;
+
+  body.innerHTML = health + findings;
+}
+
+function copyFindingFix(i) {
+  const f = DASH_STATE.findings[i];
+  if (!f) return;
+  navigator.clipboard.writeText(f.fix.text).then(() => {
+    const btn = event.target;
+    const t = btn.textContent;
+    btn.textContent = 'Copied!';
+    setTimeout(() => { btn.textContent = t; }, 1200);
+  });
+}
+
+// ── Compare ──
+async function renderCompare() {
+  const body = document.getElementById('dashBody');
+  const r = await fetch(`/api/dashboard/compare?period=${DASH_STATE.period}`);
+  const d = await r.json();
+  DASH_STATE.lastCompare = d;
+  document.getElementById('dashRangeLabel').textContent = rangeLabel(d);
+
+  if (!d.models.length) {
+    body.innerHTML = '<div class="dash-empty">No model usage in this period.</div>';
+    return;
+  }
+
+  const hdr = '<div class="compare-header">Metric</div>' + d.models.map(m =>
+    `<div class="compare-header">${escapeHtml(m.label)}<div style="font-weight:400;color:var(--text-muted);font-size:10.5px;margin-top:2px;">${m.calls} calls · ${formatCost(m.cost)}</div></div>`
+  ).join('');
+
+  function row(label, getter, fmt) {
+    const cells = d.models.map(m => {
+      const v = getter(m);
+      return `<div class="compare-value">${v == null ? '—' : fmt(v)}</div>`;
+    }).join('');
+    return `<div class="compare-metric">${label}</div>${cells}`;
+  }
+
+  const section = (title) => `<div class="compare-section">${title}</div>`;
+  const pct = v => v + '%';
+  const num = v => v.toFixed(2);
+  const tok = v => formatTokens(v);
+  const cost = v => formatCost(v);
+
+  const gridCols = `220px ${d.models.map(()=>'minmax(140px, 1fr)').join(' ')}`;
+  body.innerHTML = `<div class="compare-grid" style="grid-template-columns: ${gridCols};">
+    ${hdr}
+    ${section('Performance')}
+    ${row('One-shot rate',       m => m.performance?.one_shot_rate_pct, pct)}
+    ${row('Retry rate / edit',   m => m.performance?.retry_rate, num)}
+    ${row('Self-correction %',   m => m.performance?.self_correction_pct, pct)}
+    ${section('Efficiency')}
+    ${row('Cost per call',       m => m.efficiency?.cost_per_call, cost)}
+    ${row('Cost per edit',       m => m.efficiency?.cost_per_edit, cost)}
+    ${row('Output tokens / call', m => m.efficiency?.output_tokens_per_call, tok)}
+    ${row('Cache hit rate',      m => m.efficiency?.cache_hit_rate_pct, pct)}
+    ${section('Behavior')}
+    ${row('Delegation rate',     m => m.behavior?.delegation_rate_pct, pct)}
+    ${row('Planning rate',       m => m.behavior?.planning_rate_pct, pct)}
+    ${row('Avg tools / turn',    m => m.behavior?.avg_tools_per_turn, num)}
+  </div>`;
+}
+
+// ── Yield ──
+async function renderYield() {
+  const body = document.getElementById('dashBody');
+  const r = await fetch(`/api/dashboard/yield?period=${DASH_STATE.period}`);
+  const d = await r.json();
+  DASH_STATE.lastYield = d;
+  document.getElementById('dashRangeLabel').textContent = rangeLabel(d);
+
+  const b = d.breakdown;
+  const total = d.total_sessions || 1;
+  const segs = ['productive','reverted','abandoned','no-git'].map(k => {
+    const w = (b[k]?.sessions || 0) / total * 100;
+    return `<div class="yield-seg-${k}" style="flex:0 0 ${w}%;"></div>`;
+  }).join('');
+
+  const legend = [
+    ['productive','Productive','#22c55e'],
+    ['reverted','Reverted','#ef4444'],
+    ['abandoned','Abandoned','#64748b'],
+    ['no-git','No git','transparent'],
+  ].map(([k, label, dot]) => `<span><span class="dot" style="background:${dot};${dot==='transparent'?'border:1px solid var(--border);':''}"></span>${label} ${b[k]?.sessions||0} · ${formatCost(b[k]?.cost||0)}</span>`).join('');
+
+  const rows = (d.sessions || []).slice(0, 25).map(s => `<tr>
+    <td class="truncate" title="${escapeHtml(s.title)}">${escapeHtml(s.title || s.session_id.slice(0,10))}</td>
+    <td class="truncate" title="${escapeHtml(s.project_path)}">${escapeHtml(shortenPath(s.project_path))}</td>
+    <td class="num">${formatCost(s.cost)}</td>
+    <td><span class="cat-tag ${s.status}">${escapeHtml(s.status)}</span></td>
+    <td class="num">${s.commits.length}</td>
+  </tr>`).join('');
+
+  body.innerHTML = `
+    <div class="dash-card" style="margin-bottom:16px;">
+      <h4>Session outcomes · ${d.total_sessions} total</h4>
+      <div class="yield-pie"><div class="yield-bar">${segs}</div></div>
+      <div class="yield-legend">${legend}</div>
+    </div>
+    <div class="dash-card">
+      <h4>Sessions by outcome</h4>
+      ${rows ? `<table class="dash-table">
+        <thead><tr><th>Session</th><th>Project</th><th class="num">Cost</th><th>Status</th><th class="num">Commits</th></tr></thead>
+        <tbody>${rows}</tbody></table>` : '<div class="dash-empty">No sessions to classify</div>'}
+    </div>
+    <div style="font-size:11px;color:var(--text-muted);margin-top:10px;">
+      Yield correlates session timestamps with <code>git log</code> in each session's <code>cwd</code>.
+      "Abandoned" = no commit inside the session window. "Reverted" = a later <code>git revert</code> touched the commit.
+    </div>`;
+}
+
+// ── Plan ──
+async function renderPlan() {
+  const body = document.getElementById('dashBody');
+  const r = await fetch('/api/dashboard/plan');
+  const d = await r.json();
+  const current = d.plan;
+  document.getElementById('dashRangeLabel').textContent = '';
+
+  const presets = d.presets.map(p => `
+    <label style="display:flex;gap:10px;align-items:center;padding:10px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);cursor:pointer;background:${current.preset===p.key?'var(--accent-dim)':'var(--bg-surface)'};margin-bottom:8px;">
+      <input type="radio" name="plan" value="${p.key}" ${current.preset===p.key?'checked':''}>
+      <div style="flex:1;">
+        <div style="font-size:13px;font-weight:600;">${escapeHtml(p.label)}</div>
+        <div style="font-size:11px;color:var(--text-muted);">$${p.monthly_usd}/month</div>
+      </div>
+    </label>`).join('');
+
+  const customChecked = current.preset === 'custom';
+  body.innerHTML = `
+    <div class="dash-card" style="max-width:500px;">
+      <h4>Subscription plan</h4>
+      <div style="font-size:12px;color:var(--text-muted);margin-bottom:14px;">
+        Track API-equivalent spend against your plan price. Presets use publicly stated prices; they do not model token allowances.
+      </div>
+      ${presets}
+      <label style="display:flex;gap:10px;align-items:center;padding:10px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);cursor:pointer;background:${customChecked?'var(--accent-dim)':'var(--bg-surface)'};margin-bottom:8px;">
+        <input type="radio" name="plan" value="custom" ${customChecked?'checked':''}>
+        <div style="flex:1;">
+          <div style="font-size:13px;font-weight:600;">Custom</div>
+          <div style="font-size:11px;color:var(--text-muted);margin-bottom:6px;">Set your own monthly budget</div>
+          <input type="number" id="planCustomUsd" value="${customChecked?current.monthly_usd:100}" min="0" step="5" style="width:120px;background:var(--bg-raised);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:4px 8px;font-size:12px;"> USD/month
+        </div>
+      </label>
+      <label style="display:flex;gap:10px;align-items:center;padding:10px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);cursor:pointer;background:${current.preset==='none'?'var(--accent-dim)':'var(--bg-surface)'};margin-bottom:16px;">
+        <input type="radio" name="plan" value="none" ${current.preset==='none'?'checked':''}>
+        <div style="flex:1;">
+          <div style="font-size:13px;font-weight:600;">No plan</div>
+          <div style="font-size:11px;color:var(--text-muted);">Hide the plan progress bar</div>
+        </div>
+      </label>
+      <button class="dash-btn primary" onclick="savePlan()">Save plan</button>
+    </div>`;
+}
+
+async function savePlan() {
+  const selected = document.querySelector('input[name="plan"]:checked');
+  if (!selected) return;
+  const preset = selected.value;
+  const monthly = preset === 'custom' ? parseFloat(document.getElementById('planCustomUsd').value) : 0;
+  await fetch('/api/dashboard/plan', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({preset, monthly_usd: monthly}),
+  });
+  await renderPlan();
+}
+
+function downloadDashboard(fmt) {
+  window.open(`/api/dashboard/export?format=${fmt}&period=${DASH_STATE.period}`, '_blank');
 }
 
 function buildHeatmap(daily) {

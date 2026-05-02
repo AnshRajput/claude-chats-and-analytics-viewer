@@ -1,31 +1,35 @@
-# Claude Chats & Analytics Viewer
+# Ledger
 
-> Browse, search, and resume your [Claude Code](https://docs.anthropic.com/en/docs/claude-code) conversations — from the browser or terminal.
+> **Claude Code accounts.** Your conversations, cost, and waste — in one private ledger.
 
-[![PyPI version](https://img.shields.io/pypi/v/claude-chats-and-analytics-viewer?color=8b5cf6&label=PyPI)](https://pypi.org/project/claude-chats-and-analytics-viewer/)
-[![Python 3.7+](https://img.shields.io/badge/python-3.7%2B-blue)](https://python.org)
-[![Zero Dependencies](https://img.shields.io/badge/dependencies-none-22c55e)](https://pypi.org/project/claude-chats-and-analytics-viewer/)
-[![Cross Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](#install--run)
+[![PyPI](https://img.shields.io/pypi/v/claude-chats-and-analytics-viewer?color=E3FF70&label=pypi)](https://pypi.org/project/claude-chats-and-analytics-viewer/)
+[![Python 3.7+](https://img.shields.io/badge/python-3.7%2B-black)](https://python.org)
+[![Zero dependencies](https://img.shields.io/badge/dependencies-none-22c55e)](https://pypi.org/project/claude-chats-and-analytics-viewer/)
+[![Cross platform](https://img.shields.io/badge/macOS%20%7C%20Linux%20%7C%20Windows-black)](#install)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 
----
+Ledger is a local browser + terminal UI for every Claude Code conversation on your disk. It reads the JSONL sessions Claude Code writes to `~/.claude/projects/`, and gives you a browser, a CLI, and a full **Dashboard** — token usage, cost, activity, waste patterns, model comparison, and git-correlated yield.
 
-## What is this?
-
-Claude Code stores all your conversations as local files. This tool gives you a **beautiful web UI and terminal CLI** to:
-
-- Browse every conversation you've ever had with Claude Code
-- Search across titles or deep-search inside every message
-- See cost estimates, token usage, and model breakdowns
-- Bookmark important conversations
-- Export chats as Markdown or JSON
-- Resume any past conversation directly in Claude Code
-
-**100% local — no data leaves your machine.**
+Everything runs on your machine. No proxy, no wrapper, no API keys. Nothing leaves your disk.
 
 ---
 
-## Install & Run
+## What you get
+
+- **Browser & search** — every conversation you've ever had with Claude Code, with deep full-message search, project filters, bookmarks, and one-click resume.
+- **Dashboard** — a CRED-style observability panel with five sub-tabs:
+  - **Overview** — headline spend, cache hit rate, daily cost chart, 52-week activity heatmap, 13-category task classifier, top models, projects, tools, shell commands, MCP servers, and most-expensive sessions.
+  - **Optimize** — a 6-pattern waste scanner with A–F health grade and copy-paste fixes (duplicate reads, low Read:Edit ratio, cache-creation overhead, junk directory reads, uncapped bash output, bloated `CLAUDE.md`).
+  - **Compare** — side-by-side model performance: one-shot rate, retry rate, self-correction, cost per call / edit, output tokens / call, cache hit, delegation, planning, tools per turn.
+  - **Yield** — correlates sessions with `git log` in each project and labels them *productive*, *reverted*, or *abandoned*.
+  - **Plan** — subscription tracking for Claude Max / Pro / Cursor Pro / custom monthly budgets.
+- **Export** — per-conversation `.md` / `.json`, zip of all conversations, full dashboard CSV/JSON.
+- **Terminal CLI** — paginated interactive browser with keyboard navigation, search, bookmarks, and direct resume into Claude Code.
+- **Zero dependencies.** Python standard library only.
+
+---
+
+## Install
 
 ### macOS / Linux
 
@@ -39,138 +43,173 @@ curl -fsSL https://raw.githubusercontent.com/AnshRajput/claude-chats-and-analyti
 iwr https://raw.githubusercontent.com/AnshRajput/claude-chats-and-analytics-viewer/main/install.ps1 | iex
 ```
 
-The installer handles everything — installs `pipx` if needed, installs the package, and opens the viewer automatically.
-
-### Manual install
+### Manual
 
 ```bash
-pipx install claude-chats-and-analytics-viewer    # recommended
-uvx claude-chats-and-analytics-viewer             # uv, no install needed
+pipx install claude-chats-and-analytics-viewer      # recommended
+uvx claude-chats-and-analytics-viewer               # uv, no install
 pip3 install --user claude-chats-and-analytics-viewer
 ```
 
-> Don't have `pipx`?
-> - macOS: `brew install pipx && pipx ensurepath`
-> - Linux: `python3 -m pip install --user pipx && python3 -m pipx ensurepath`
-> - Windows: `pip install pipx && pipx ensurepath`
->
-> After running `ensurepath`, open a new terminal and run `ccv`.
+Don't have `pipx`?
+- macOS: `brew install pipx && pipx ensurepath`
+- Linux: `python3 -m pip install --user pipx && python3 -m pipx ensurepath`
+- Windows: `pip install pipx && pipx ensurepath`
+
+Run a new terminal after `ensurepath` and type `ccv`.
 
 ---
 
-## Features
-
-### Web UI
-| Feature | Description |
-|---|---|
-| **Conversation browser** | Search, filter by project, sort by date / tokens / cost |
-| **Cost estimation** | Per-conversation and per-message USD cost based on model pricing |
-| **Deep search** | Toggle `DEEP` to search inside every message, not just titles |
-| **Bookmarks** | Star any conversation — persisted across sessions |
-| **Activity heatmap** | GitHub-style 52-week calendar showing your Claude usage |
-| **Copy buttons** | One-click copy on every code block |
-| **Auto-refresh** | Detects new conversations while the viewer is open |
-| **Export** | Download as `.md`, `.json`, or export everything as a `.zip` |
-| **Smart caching** | Near-instant startup after first run |
-| **Usage stats** | Token counts, model breakdown, top projects, total cost |
-
-### Terminal CLI
-| Feature | Description |
-|---|---|
-| **Interactive browser** | Paginated list with colored output and keyboard navigation |
-| **Search** | Filter conversations by keyword or project |
-| **View** | Read full conversation messages in the terminal |
-| **Resume** | Jump directly back into any past conversation in Claude Code |
-| **Bookmarks** | Toggle bookmarks from the terminal |
-
----
-
-## Commands
-
-### Web UI (`ccv`)
+## Run
 
 ```bash
-ccv                        # start the viewer (opens browser automatically)
+ccv                        # start Ledger (opens browser)
 ccv --port 8080            # use a different port
-ccv --no-open              # start server without opening browser
-ccv --update               # update to the latest version
+ccv --no-open              # start without opening the browser
+ccv --update               # update to latest
 ccv --install              # auto-start on login (macOS LaunchAgent)
 ccv --install-systemd      # auto-start on login (Linux systemd)
 ccv --uninstall            # remove the auto-start service
 ```
 
-### Terminal CLI (`ccvc`)
+Terminal CLI:
 
 ```bash
 ccvc                              # interactive browser
-ccvc -v                           # show version and exit
-ccvc --check-update               # check for available updates
-ccvc --search "auth bug"          # search by keyword
+ccvc -v                           # version
+ccvc --check-update               # check PyPI for a newer version
+ccvc --search "auth bug"          # filter by keyword
 ccvc --project "myapp"            # filter by project
 ccvc --view <session-id>          # view a conversation
 ccvc --resume <session-id>        # resume in Claude Code
-ccvc --list                       # non-interactive list (pipe-friendly)
-ccvc --list --limit 10            # limit results
+ccvc --list --limit 10            # non-interactive list
 ```
 
-### Interactive CLI keyboard commands
+### Keyboard shortcuts (CLI)
 
 | Key | Action |
 |---|---|
-| `3` | Show details for conversation #3 |
-| `v 3` | Read full messages of conversation #3 |
-| `r 3` | Resume conversation #3 in Claude Code |
-| `b 3` | Toggle bookmark on conversation #3 |
-| `s <query>` | Search conversations |
-| `a` | Clear search, show all |
+| `3` | Details for conversation #3 |
+| `v 3` | Read the full messages of #3 |
+| `r 3` | Resume #3 in Claude Code |
+| `b 3` | Toggle bookmark on #3 |
+| `s <query>` | Search |
+| `a` | Clear search |
 | `n` / `p` | Next / previous page |
-| `h` | Show help |
 | `q` | Quit |
 
 ---
 
-## Update
+## Dashboard API
 
-```bash
-ccv --update                                      # update via web UI command
-ccvc --check-update                               # check current vs latest version
-# or
-pipx upgrade claude-chats-and-analytics-viewer
-```
+The web UI is a thin layer over a local JSON API you can script against:
 
-When an update is available, a banner with an **Update Now** button appears in the Web UI, and a notice prints in the CLI automatically.
+| Endpoint | Returns |
+|---|---|
+| `GET /api/dashboard?period=<today\|7d\|30d\|month\|all\|custom>&from=&to=` | Overview, daily chart, projects, models, activities (13 categories with one-shot rate), core tools, shell commands, MCP servers, top sessions |
+| `GET /api/dashboard/optimize?period=...` | Waste-pattern findings with impact, tokens saved, and copy-paste fixes; A–F health grade |
+| `GET /api/dashboard/compare?period=...&models=a,b` | Per-model performance + efficiency + behavior metrics |
+| `GET /api/dashboard/yield?period=...&project=...` | Session outcomes correlated with `git log` (productive / reverted / abandoned / no-git) |
+| `GET /api/dashboard/plan` / `POST /api/dashboard/plan` | Read or set your monthly plan (`claude-max`, `claude-pro`, `cursor-pro`, `custom`, `none`) |
+| `GET /api/dashboard/export?format=csv\|json&period=...` | Downloadable multi-period export |
+
+Every endpoint respects the selected period and stays 100% local.
+
+---
+
+## How the task classifier works
+
+Each assistant turn is assigned to one of 13 categories by matching tools used + keywords in your message (no LLM calls, deterministic):
+
+| Category | Triggered by |
+|---|---|
+| coding | Edit / Write / NotebookEdit tools |
+| debugging | coding turn + "fix / bug / error / broken / traceback" keywords |
+| feature | coding turn + "add / create / implement / new" |
+| refactoring | coding turn + "refactor / rename / simplify" |
+| testing | Bash running pytest / vitest / jest / mocha / coverage |
+| exploration | Read / Grep / Glob / WebSearch / MCP only, no edits |
+| planning | `EnterPlanMode` used, or TaskCreate without edits |
+| delegation | Agent / Task tool spawned |
+| git | Bash with `git push/commit/merge/rebase/...` |
+| build/deploy | `npm run build`, `docker`, `pm2`, `systemctl`, etc. |
+| brainstorming | No tools, message about "idea / what if / strategy" |
+| conversation | No tools, pure dialogue |
+| general | Skill tool / uncategorized |
+
+From this the dashboard computes **one-shot rate** per category (the share of edit turns that didn't need a retry) — the cleanest signal for how well Claude got it right on the first try.
 
 ---
 
 ## How it works
 
-Claude Code saves conversations as JSONL files at:
+```
+~/.claude/projects/<project-slug>/<session-id>.jsonl
+                           │
+                           ▼
+  parser.py  →  per-turn data (tools, tokens, model, classifier)
+                           │
+                           ▼
+  store.py   →  mtime-keyed metadata cache (v3, tmpdir)
+                           │
+                           ▼
+  web.py  ←  HTTP server  →  single-page Dashboard UI
+  cli.py  ←  terminal UI
+```
+
+Claude Code writes session transcripts as JSONL. Ledger reads them, parses per-turn usage + tool calls, caches the result, and serves everything from a local HTTP server on `127.0.0.1:5005`. Nothing is uploaded.
+
+---
+
+## Project structure
 
 ```
-~/.claude/projects/<project-name>/<session-id>.jsonl          # macOS / Linux
-%USERPROFILE%\.claude\projects\<project-name>\<session-id>.jsonl  # Windows
+claude_conversation_viewer/
+├── __init__.py              # __version__
+├── web.py                   # HTTP handler + single-file HTML/CSS/JS UI
+├── cli.py                   # Interactive terminal CLI
+├── update_checker.py        # PyPI update check
+├── pricing.py               # Model pricing table + cost helpers
+├── classifier.py            # 13-category deterministic classifier
+├── parser.py                # JSONL parsing (metadata + per-turn + full messages)
+├── cache.py                 # Metadata cache v3, bookmarks, plan storage
+├── store.py                 # ConversationStore
+└── dashboard/
+    ├── aggregator.py        # /api/dashboard payload
+    ├── optimize.py          # Waste detectors + A–F grade
+    ├── compare.py           # Model comparison
+    ├── yield_tracker.py     # Git-correlated yield
+    ├── plans.py             # Subscription presets
+    ├── export.py            # CSV / JSON export
+    └── period.py            # Period parsing
 ```
-
-This tool scans those files, caches the metadata for fast startup, and serves a local web UI at `http://127.0.0.1:5005`. Nothing is uploaded or shared anywhere.
 
 ---
 
 ## Troubleshooting
 
 **`ccv` not found after install**
-Run `pipx ensurepath`, then open a new terminal.
+Run `pipx ensurepath` and open a new terminal.
 
 **Port already in use**
-`ccv` automatically switches to the next available port and tells you which one it picked.
-Or specify one manually: `ccv --port 8080`
+Ledger automatically falls through to the next available port and prints it; or specify `ccv --port 8080`.
 
 **No conversations found**
-Make sure you've used Claude Code at least once. Check that `~/.claude/projects/` exists and contains `.jsonl` files:
+Make sure you've run Claude Code at least once. Check:
 ```bash
 ls ~/.claude/projects/
+find ~/.claude/projects -name "*.jsonl" | head
 ```
 
+**Update check not working**
+Requires network access to `pypi.org`. Fails silently by design.
+
 ---
+
+## Credits
+
+- Dashboard observability inspired by [codeburn](https://github.com/getagentseal/codeburn) — the terminal-first sibling that tracks the same data across 16 AI coding tools.
+- Visual language: CRED-style premium minimalism — warm black neutrals, Inter Tight, JetBrains Mono, one chartreuse accent.
 
 ## License
 
