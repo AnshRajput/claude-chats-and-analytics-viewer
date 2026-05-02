@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Claude Code Conversation Viewer - CLI
-======================================
+Ledger — Claude Code accounts (terminal CLI)
+============================================
 Browse, search, and resume your Claude Code conversations from the terminal.
 
 Usage:
@@ -371,7 +371,7 @@ def print_welcome(total: int):
     # Top border
     print(f"  {C.LAVENDER}{Box.TL}{Box.H * bw}{Box.TR}{C.RESET}")
     # Title
-    title = " Claude Code Conversations "
+    title = " Ledger  ·  Claude Code accounts "
     pad = bw - len(title)
     lp = pad // 2
     rp = pad - lp
@@ -868,7 +868,7 @@ def _resolve_conversation(target: str, conversations: list, page: int, page_size
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Claude Code Conversation Viewer - CLI",
+        description="Ledger — Claude Code accounts (terminal)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Examples:
@@ -906,7 +906,7 @@ def main():
         result = check_for_update_sync()
         current = result.get("current_version", "unknown")
         latest = result.get("latest_version", current)
-        print(f"\n  {C.BOLD}Claude Conversation Viewer — update check{C.RESET}")
+        print(f"\n  {C.BOLD}Ledger — update check{C.RESET}")
         print(f"  {C.GRAY}Current version :{C.RESET} {C.WHITE}v{current}{C.RESET}")
         print(f"  {C.GRAY}Latest version  :{C.RESET} {C.WHITE}v{latest}{C.RESET}")
         if result.get("update_available"):

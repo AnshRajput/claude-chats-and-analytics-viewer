@@ -3895,7 +3895,7 @@ def install_systemd_service(port: int):
     service_path = service_dir / "claude-conversation-viewer.service"
     python = sys.executable
     service_content = f"""[Unit]
-Description=Claude Code Conversation Viewer
+Description=Ledger (Claude Code accounts)
 After=network.target
 
 [Service]
@@ -3918,7 +3918,7 @@ WantedBy=default.target
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Claude Code Conversation Viewer")
+    parser = argparse.ArgumentParser(description="Ledger — Claude Code accounts (web)")
     parser.add_argument("--port", type=int, default=5005)
     parser.add_argument("--no-open", action="store_true")
     parser.add_argument("--install", action="store_true", help="Install macOS LaunchAgent")
@@ -3970,7 +3970,7 @@ def main():
         server = HTTPServer(("127.0.0.1", port), Handler)
     url = f"http://127.0.0.1:{port}"
 
-    print(f"\n  Claude Code Conversation Viewer  v{__version__}")
+    print(f"\n  Ledger · Claude Code accounts  v{__version__}")
     print(f"  ═══════════════════════════════════════")
     print(f"  {len(STORE.conversations)} conversations · {len(STORE.projects)} projects")
     print(f"  Running at: {url}")
